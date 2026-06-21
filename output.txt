@@ -1,0 +1,7 @@
+Embedding model loaded on cpu (ResNet-50, 2048-d)
+Traceback (most recent call last):
+  File "D:\scanoza\backend\main.py", line 15, in <module>
+    from routes import router
+  File "D:\scanoza\backend\routes.py", line 35, in <module>
+    from stegano import lsb
+ModuleNotFoundError: No module named 'stegano'

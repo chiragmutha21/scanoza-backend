@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    container_name: scanoza-backend
+    ports:
+      - "127.0.0.1:9001:9001"
+    environment:
+      - PORT=9001
+      - MONGO_URI=${MONGO_URI}
+      - UPLOAD_DIR=uploads
+      - FAISS_INDEX_PATH=data/faiss_index.bin
+      - FAISS_MAPPING_PATH=data/id_mapping.json
+      - CLOUDINARY_CLOUD_NAME=${CLOUDINARY_CLOUD_NAME}
+      - CLOUDINARY_API_KEY=${CLOUDINARY_API_KEY}
+      - CLOUDINARY_API_SECRET=${CLOUDINARY_API_SECRET}
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+    restart: always
