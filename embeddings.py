@@ -56,9 +56,13 @@ def load_image_from_path_or_url(image_path: str, grayscale: bool = False) -> np.
             raise ValueError(f"Failed to decode remote image: {image_path}")
         return image
 
-    local_path = image_path
-    if not os.path.isabs(local_path):
-        local_path = os.path.join(os.getcwd(), image_path.lstrip("/\\"))
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    local_path = os.path.normpath(
+        os.path.join(
+            BASE_DIR,
+            image_path.lstrip("/\\")
+        )
+    )
     image = cv2.imread(local_path, mode)
     if image is None:
         raise FileNotFoundError(f"Could not load local image: {local_path}")

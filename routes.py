@@ -1158,16 +1158,12 @@ async def scan_frame(
                         # Disambiguate based on template cross-correlation and keypoint matches.
                         should_swap = False
                         if rival_id:
-                            # Rule A: If one has a significantly better correlation, trust it! (Checks entire image details)
-                            if abs(correlation1 - correlation2) >= 0.08:
-                                if correlation2 > correlation1:
-                                    print(f"  [CORRELATION SWAP] Rival has significantly better template correlation ({correlation2:.3f} > {correlation1:.3f})")
-                                    should_swap = True
-                            # Rule B: If correlations are close, swap if rival has significantly more keypoints
+                            # If the rival has a significantly better correlation and has at least 15 inliers, swap.
+                            if correlation2 > correlation1 + 0.08 and orb_score2 >= 15:
+                                print(f"  [CORRELATION SWAP] Rival has significantly better template correlation ({correlation2:.3f} > {correlation1:.3f})")
+                                should_swap = True
                             else:
-                                if orb_score2 > orb_score1 + 10:
-                                    print(f"  [ORB SWAP] Rival has significantly better keypoint match ({orb_score2} > {orb_score1})")
-                                    should_swap = True
+                                should_swap = False
                                     
                         if should_swap:
                             best_id, rival_id = rival_id, best_id
