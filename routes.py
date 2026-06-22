@@ -89,15 +89,15 @@ CONSENSUS_THRESHOLD = 0.18   # Legacy constant retained for backward compatibili
 MIN_SCORE_GAP = 0.05         # Legacy constant retained for backward compatibility
 
 # Unified scan decision config (single source of truth)
-AI_MATCH_THRESHOLD = 0.35         # Final weighted confidence needed for candidate acceptance
-AI_GAP_THRESHOLD = 0.20           # Top-1 minus Top-2 minimum margin
-AI_MIN_SCAN_THRESHOLD = 0.20      # Minimum raw AI score to consider any match
-ORB_THRESHOLD = 15                # Minimum ORB verification score
+AI_MATCH_THRESHOLD = 0.22         # Final weighted confidence needed for candidate acceptance
+AI_GAP_THRESHOLD = 0.03           # Top-1 minus Top-2 minimum margin (highly relaxed for unique database items)
+AI_MIN_SCAN_THRESHOLD = 0.15      # Minimum raw AI score to consider any match
+ORB_THRESHOLD = 6                 # Minimum ORB verification score
 VOTE_WEIGHT = 0.30                # Weight for vote consistency
 MAX_SCORE_WEIGHT = 0.50           # Weight for max score
 AVG_SCORE_WEIGHT = 0.20           # Weight for average score
-MIN_VOTE_RATIO = 0.25             # Candidate must win at least this share of crops
-HIGH_CONFIDENCE_RELAX = 0.90      # Very high AI score can bypass ORB if watermark is present
+MIN_VOTE_RATIO = 0.15             # Candidate must win at least this share of crops
+HIGH_CONFIDENCE_RELAX = 0.35      # Very high AI score can bypass ORB entirely
 ORB_RATIO_TEST = 0.75             # Lowe ratio test threshold
 ORB_RANSAC_REPROJ = 5.0           # Homography reprojection threshold
 ENFORCE_WATERMARK = False         # Keep false for cross-device reliability (Android/iPhone)
@@ -1056,10 +1056,13 @@ async def scan_frame(
                         # 3. Watermark Check
                         is_watermarked = check_watermark_presence(temp_path)
                         
-                        # Accept only after AI gate, then ORB or very high-confidence fallback
-                        if ai_gate_passed and (
-                            best_score >= HIGH_CONFIDENCE_RELAX
-                            or (orb_score1 > orb_score2 and orb_score1 >= ORB_THRESHOLD)
+                        # Accept if AI gate passed AND (high confidence or ORB verified)
+                        # OR if it's an extremely high confidence AI match (best_score >= 0.50) bypassing the gate
+                        if (best_score >= 0.50) or (
+                            ai_gate_passed and (
+                                best_score >= HIGH_CONFIDENCE_RELAX
+                                or (orb_score1 > orb_score2 and orb_score1 >= ORB_THRESHOLD)
+                            )
                         ):
                             if ENFORCE_WATERMARK and not is_watermarked:
                                 return ScanResponse(
