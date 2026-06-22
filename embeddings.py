@@ -56,11 +56,18 @@ def load_image_from_path_or_url(image_path: str, grayscale: bool = False) -> np.
             raise ValueError(f"Failed to decode remote image: {image_path}")
         return image
 
+    # Extract the relative path starting from 'uploads/' to avoid duplicating parent directories in Docker/Linux
+    rel_path = image_path
+    if "uploads/" in rel_path:
+        rel_path = rel_path[rel_path.find("uploads/"):]
+    elif "uploads\\" in rel_path:
+        rel_path = rel_path[rel_path.find("uploads\\"):]
+
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     local_path = os.path.normpath(
         os.path.join(
             BASE_DIR,
-            image_path.lstrip("/\\")
+            rel_path.lstrip("/\\")
         )
     )
     image = cv2.imread(local_path, mode)

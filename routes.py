@@ -1081,10 +1081,16 @@ async def scan_frame(
                                             return {"orb": 0, "correlation": 0.0}
                                 # Case 2: Local File Path
                                 else:
-                                    target_path = image_path.replace('/uploads/', 'uploads/').lstrip("/")
-                                    # Remove leading slash or backslash
-                                    target_path = re.sub(r'^[/\\]+', '', target_path)
-                                    abs_local_path = os.path.join(os.getcwd(), target_path)
+                                    rel_path = image_path
+                                    if "uploads/" in rel_path:
+                                        rel_path = rel_path[rel_path.find("uploads/"):]
+                                    elif "uploads\\" in rel_path:
+                                        rel_path = rel_path[rel_path.find("uploads\\"):]
+
+                                    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+                                    abs_local_path = os.path.normpath(
+                                        os.path.join(BASE_DIR, rel_path.lstrip("/\\"))
+                                    )
                                     if not os.path.exists(abs_local_path):
                                         print(f"[VERIFY] Local file not found: {abs_local_path}")
                                         return {"orb": 0, "correlation": 0.0}
