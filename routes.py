@@ -1052,19 +1052,21 @@ async def scan_frame(
                     if best_score >= AI_MIN_SCAN_THRESHOLD:
                         print(f"  [VERIFY] Score: {best_score:.2f}. Checking details...")
                         
-                        async def get_orb_score(target_id, frame_path):
+                        async def get_detailed_similarity(target_id, frame_path):
                             """
-                            Performs pixel-level verification using ORB.
-                            Handles both local file paths and Cloudinary URLs.
+                            Loads both images in color, calculates:
+                            1. ORB inliers count
+                            2. HSV Color Histogram Similarity
+                            Returns a dict: {"orb": inliers_count, "color": color_similarity}
                             """
                             try:
                                 # Get original image path from DB
                                 img_col = get_images_collection()
                                 doc = await img_col.find_one({"contentId": target_id})
-                                if not doc: return 0
+                                if not doc: return {"orb": 0, "color": 0.0}
                                 
                                 image_path = doc['imagePath']
-                                target_img_data = None
+                                img1_bgr = None
 
                                 # Case 1: Cloudinary URL or HTTP URL
                                 if image_path.startswith("http"):
@@ -1072,70 +1074,107 @@ async def scan_frame(
                                         resp = await client.get(image_path)
                                         if resp.status_code == 200:
                                             target_img_data = np.frombuffer(resp.content, np.uint8)
-                                            img1 = cv2.imdecode(target_img_data, cv2.IMREAD_GRAYSCALE)
+                                            img1_bgr = cv2.imdecode(target_img_data, cv2.IMREAD_COLOR)
                                         else:
-                                            print(f"[ORB] Failed to download {image_path}: {resp.status_code}")
-                                            return 0
+                                            print(f"[VERIFY] Failed to download {image_path}: {resp.status_code}")
+                                            return {"orb": 0, "color": 0.0}
                                 # Case 2: Local File Path
                                 else:
                                     target_path = image_path.replace('/uploads/', 'uploads/').lstrip("/")
-                                    if not os.path.exists(target_path):
-                                        print(f"[ORB] Local file not found: {target_path}")
-                                        return 0
-                                    img1 = cv2.imread(target_path, cv2.IMREAD_GRAYSCALE)
+                                    # Remove leading slash or backslash
+                                    target_path = re.sub(r'^[/\\]+', '', target_path)
+                                    abs_local_path = os.path.join(os.getcwd(), target_path)
+                                    if not os.path.exists(abs_local_path):
+                                        print(f"[VERIFY] Local file not found: {abs_local_path}")
+                                        return {"orb": 0, "color": 0.0}
+                                    img1_bgr = cv2.imread(abs_local_path, cv2.IMREAD_COLOR)
                                 
-                                if img1 is None: return 0
+                                if img1_bgr is None: return {"orb": 0, "color": 0.0}
 
-                                # Read the current scan frame
-                                img2 = cv2.imread(frame_path, cv2.IMREAD_GRAYSCALE)
-                                if img2 is None: return 0
+                                # Read the current scan frame in color
+                                img2_bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+                                if img2_bgr is None: return {"orb": 0, "color": 0.0}
                                 
-                                # Use ORB (Fast & Efficient)
+                                # 1. Calculate HSV Color Similarity
+                                color_sim = 0.0
+                                try:
+                                    hsv1 = cv2.cvtColor(img1_bgr, cv2.COLOR_BGR2HSV)
+                                    hsv2 = cv2.cvtColor(img2_bgr, cv2.COLOR_BGR2HSV)
+                                    # H and S channels histogram
+                                    hist1 = cv2.calcHist([hsv1], [0, 1], None, [50, 60], [0, 180, 0, 256])
+                                    hist2 = cv2.calcHist([hsv2], [0, 1], None, [50, 60], [0, 180, 0, 256])
+                                    cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
+                                    cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
+                                    color_sim = float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL))
+                                    color_sim = max(0.0, color_sim)
+                                except Exception as hist_err:
+                                    print(f"[HIST ERROR] {hist_err}")
+                                
+                                # 2. Convert to grayscale for ORB keypoint matching
+                                img1_gray = cv2.cvtColor(img1_bgr, cv2.COLOR_BGR2GRAY)
+                                img2_gray = cv2.cvtColor(img2_bgr, cv2.COLOR_BGR2GRAY)
+                                
                                 orb = cv2.ORB_create(nfeatures=500)
-                                kp1, des1 = orb.detectAndCompute(img1, None)
-                                kp2, des2 = orb.detectAndCompute(img2, None)
+                                kp1, des1 = orb.detectAndCompute(img1_gray, None)
+                                kp2, des2 = orb.detectAndCompute(img2_gray, None)
                                 
-                                if des1 is None or des2 is None: return 0
-                                
-                                # Brute-Force Matcher with Ratio Test or Homography
-                                bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-                                matches = bf.knnMatch(des1, des2, k=2)
-                                
-                                # Apply Lowe's ratio test
-                                good_matches = []
-                                for m, n in matches:
-                                    if m.distance < ORB_RATIO_TEST * n.distance:
-                                        good_matches.append(m)
-                                
-                                # Homography verification (RANSAC)
-                                if len(good_matches) > 10:
-                                    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                                    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                                    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ORB_RANSAC_REPROJ)
-                                    if M is not None:
-                                        return int(np.sum(mask))
-                                
-                                return len(good_matches)
+                                inliers = 0
+                                if des1 is not None and des2 is not None:
+                                    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+                                    matches = bf.knnMatch(des1, des2, k=2)
+                                    
+                                    good_matches = []
+                                    for m, n in matches:
+                                        if m.distance < ORB_RATIO_TEST * n.distance:
+                                            good_matches.append(m)
+                                    
+                                    if len(good_matches) > 10:
+                                        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                                        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                                        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ORB_RANSAC_REPROJ)
+                                        if M is not None:
+                                            inliers = int(np.sum(mask))
+                                        else:
+                                            inliers = len(good_matches)
+                                    else:
+                                        inliers = len(good_matches)
+                                        
+                                return {"orb": inliers, "color": color_sim}
                             except Exception as e:
-                                print(f"[ORB ERROR] {e}")
-                                return 0
+                                print(f"[DETAILED SIM ERROR] {e}")
+                                return {"orb": 0, "color": 0.0}
 
-                        # Check Top 1 and Top 2
-                        orb_score1 = await get_orb_score(best_id, temp_path)
+                        # Compute detailed similarity for Top 1 and Top 2
+                        sim1 = await get_detailed_similarity(best_id, temp_path)
+                        orb_score1 = sim1["orb"]
+                        color_sim1 = sim1["color"]
                         
                         rival_id = sorted_candidates[1][0] if len(sorted_candidates) > 1 else None
-                        orb_score2 = await get_orb_score(rival_id, temp_path) if rival_id else 0
+                        sim2 = await get_detailed_similarity(rival_id, temp_path) if rival_id else {"orb": 0, "color": 0.0}
+                        orb_score2 = sim2["orb"]
+                        color_sim2 = sim2["color"]
                         
-                        print(f"  [OPENCV] Scores -> Best: {orb_score1} matches | Rival: {orb_score2} matches")
+                        print(f"  [OPENCV] Scores -> Best: ORB={orb_score1}, Color={color_sim1:.3f} | Rival: ORB={orb_score2}, Color={color_sim2:.3f}")
                         
-                        # Swap if the rival has a better pixel-level geometric keypoint match.
-                        # This disambiguates extremely similar templates (like IN and OUT targets).
-                        if rival_id and orb_score2 > orb_score1:
-                            print(f"  [ORB SWAP] Rival has more keypoint matches ({orb_score2} > {orb_score1}). Swapping best target to {rival_id[:12]}")
+                        # Disambiguate based on color similarity and keypoint matches.
+                        should_swap = False
+                        if rival_id:
+                            # Rule A: If color similarity difference is significant, trust color!
+                            if abs(color_sim1 - color_sim2) >= 0.08:
+                                if color_sim2 > color_sim1:
+                                    print(f"  [COLOR SWAP] Rival has significantly better color match ({color_sim2:.3f} > {color_sim1:.3f})")
+                                    should_swap = True
+                            # Rule B: If colors are similar, trust ORB keypoint geometric matching
+                            else:
+                                if orb_score2 > orb_score1:
+                                    print(f"  [ORB SWAP] Rival has better keypoint match ({orb_score2} > {orb_score1})")
+                                    should_swap = True
+                                    
+                        if should_swap:
                             best_id, rival_id = rival_id, best_id
                             orb_score1, orb_score2 = orb_score2, orb_score1
+                            color_sim1, color_sim2 = color_sim2, color_sim1
                             best_score, second_best_score = second_best_score, best_score
-                            # Re-evaluate gap and gate
                             score_gap = best_score - second_best_score
                             ai_gate_passed = True
                         
