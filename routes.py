@@ -14,6 +14,7 @@ Step 2 (Attach Multimedia Content):
   DELETE /api/attached-content/{id}     — Delete a specific attachment
 """
 import os
+import re
 import uuid
 import shutil
 from datetime import datetime, timezone
@@ -181,6 +182,73 @@ async def _find_duplicate_target(collection, image_hash: str, image_dhash: str):
     except Exception as e:
         print(f"Error finding duplicate target: {e}")
         return None
+
+
+async def _is_actual_duplicate(img_path_1: str, img_path_2_or_url: str) -> bool:
+    """
+    Performs a strict pixel-level and ORB similarity check between two images.
+    Returns True only if they are virtually identical (same image).
+    Allows visually similar templates (like IN and OUT) to be uploaded.
+    """
+    try:
+        # Load image 1 (local path)
+        img1 = cv2.imread(img_path_1, cv2.IMREAD_GRAYSCALE)
+        if img1 is None:
+            return False
+            
+        # Load image 2 (local path or URL)
+        if img_path_2_or_url.startswith("http"):
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(img_path_2_or_url)
+                if resp.status_code != 200:
+                    return False
+                img2_data = np.frombuffer(resp.content, np.uint8)
+                img2 = cv2.imdecode(img2_data, cv2.IMREAD_GRAYSCALE)
+        else:
+            local_path = img_path_2_or_url.replace('/uploads/', 'uploads/').lstrip("/")
+            # Remove leading slash or backslash
+            local_path = re.sub(r'^[/\\]+', '', local_path)
+            abs_local_path = os.path.join(os.getcwd(), local_path)
+            if not os.path.exists(abs_local_path):
+                return False
+            img2 = cv2.imread(abs_local_path, cv2.IMREAD_GRAYSCALE)
+            
+        if img2 is None:
+            return False
+            
+        # Resize to same dimensions for comparison
+        h1, w1 = img1.shape
+        img2 = cv2.resize(img2, (w1, h1))
+        
+        # Calculate Mean Squared Error (MSE)
+        err = np.sum((img1.astype("float") - img2.astype("float")) ** 2)
+        err /= float(img1.shape[0] * img1.shape[1])
+        
+        # If the pixel error is extremely low, they are identical
+        if err < 50.0:
+            return True
+            
+        # Also run ORB to check keypoint correspondence
+        orb = cv2.ORB_create(nfeatures=500)
+        kp1, des1 = orb.detectAndCompute(img1, None)
+        kp2, des2 = orb.detectAndCompute(img2, None)
+        
+        if des1 is None or des2 is None:
+            return False
+            
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(des1, des2)
+        
+        match_ratio = len(matches) / min(len(kp1), len(kp2))
+        
+        # If almost all keypoints match exactly and MSE is low, they are duplicates
+        if err < 1500.0 and match_ratio > 0.90:
+            return True
+            
+        return False
+    except Exception as e:
+        print(f"Error checking actual duplicate: {e}")
+        return False
 
 
 @router.get("/debug/status")
@@ -399,31 +467,38 @@ async def upload_content(
 
     is_update = False
     if duplicate:
-        dup_content_id = duplicate.get("contentId")
+        # Perform deep pixel and ORB validation to verify if this is an actual duplicate
         dup_image_path = duplicate.get("imagePath", "")
+        is_actual_dup = await _is_actual_duplicate(abs_image_path, dup_image_path)
         
-        is_missing = False
-        if dup_image_path and not dup_image_path.startswith("http"):
-            abs_dup_path = os.path.join(os.getcwd(), dup_image_path.lstrip("/\\"))
-            if not os.path.exists(abs_dup_path):
+        if is_actual_dup:
+            dup_content_id = duplicate.get("contentId")
+            is_missing = False
+            if dup_image_path and not dup_image_path.startswith("http"):
+                abs_dup_path = os.path.join(os.getcwd(), dup_image_path.lstrip("/\\"))
+                if not os.path.exists(abs_dup_path):
+                    is_missing = True
+            
+            if dup_content_id not in faiss_index.id_to_idx:
                 is_missing = True
-        
-        if dup_content_id not in faiss_index.id_to_idx:
-            is_missing = True
 
-        if is_missing:
-            print(f"[RE-INDEX] Target {dup_content_id} is missing its file or FAISS index. Updating/Re-indexing.")
-            content_id = dup_content_id
-            is_update = True
+            if is_missing:
+                print(f"[RE-INDEX] Target {dup_content_id} is missing its file or FAISS index. Updating/Re-indexing.")
+                content_id = dup_content_id
+                is_update = True
+            else:
+                _remove_file_if_exists(abs_image_path)
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "This image already exists in the database. Please upload a different target image.",
+                        "duplicateOfContentId": duplicate.get("contentId"),
+                    },
+                )
         else:
-            _remove_file_if_exists(abs_image_path)
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": "This image already exists in the database. Please upload a different target image.",
-                    "duplicateOfContentId": duplicate.get("contentId"),
-                },
-            )
+            # Not an actual duplicate, just a similar template! Allow it as a new target image.
+            print(f"[UPLOAD] Visually similar template detected but allowed (distinct pixel layout).")
+            duplicate = None
 
     # QUALITY CHECK (Point 9)
     quality = check_image_quality(abs_image_path)
@@ -1052,6 +1127,17 @@ async def scan_frame(
                         orb_score2 = await get_orb_score(rival_id, temp_path) if rival_id else 0
                         
                         print(f"  [OPENCV] Scores -> Best: {orb_score1} matches | Rival: {orb_score2} matches")
+                        
+                        # Swap if the rival has a better pixel-level geometric keypoint match.
+                        # This disambiguates extremely similar templates (like IN and OUT targets).
+                        if rival_id and orb_score2 > orb_score1:
+                            print(f"  [ORB SWAP] Rival has more keypoint matches ({orb_score2} > {orb_score1}). Swapping best target to {rival_id[:12]}")
+                            best_id, rival_id = rival_id, best_id
+                            orb_score1, orb_score2 = orb_score2, orb_score1
+                            best_score, second_best_score = second_best_score, best_score
+                            # Re-evaluate gap and gate
+                            score_gap = best_score - second_best_score
+                            ai_gate_passed = True
                         
                         # 3. Watermark Check
                         is_watermarked = check_watermark_presence(temp_path)
