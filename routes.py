@@ -1054,16 +1054,17 @@ async def scan_frame(
                         
                         async def get_detailed_similarity(target_id, frame_path):
                             """
-                            Loads both images in color, calculates:
+                            Loads both images, aligns them using ORB keypoint homography warping,
+                            and calculates:
                             1. ORB inliers count
-                            2. HSV Color Histogram Similarity
-                            Returns a dict: {"orb": inliers_count, "color": color_similarity}
+                            2. Resized Normalized Cross-Correlation (entire image comparison)
+                            Returns a dict: {"orb": inliers_count, "correlation": correlation_coefficient}
                             """
                             try:
                                 # Get original image path from DB
                                 img_col = get_images_collection()
                                 doc = await img_col.find_one({"contentId": target_id})
-                                if not doc: return {"orb": 0, "color": 0.0}
+                                if not doc: return {"orb": 0, "correlation": 0.0}
                                 
                                 image_path = doc['imagePath']
                                 img1_bgr = None
@@ -1077,7 +1078,7 @@ async def scan_frame(
                                             img1_bgr = cv2.imdecode(target_img_data, cv2.IMREAD_COLOR)
                                         else:
                                             print(f"[VERIFY] Failed to download {image_path}: {resp.status_code}")
-                                            return {"orb": 0, "color": 0.0}
+                                            return {"orb": 0, "correlation": 0.0}
                                 # Case 2: Local File Path
                                 else:
                                     target_path = image_path.replace('/uploads/', 'uploads/').lstrip("/")
@@ -1086,39 +1087,26 @@ async def scan_frame(
                                     abs_local_path = os.path.join(os.getcwd(), target_path)
                                     if not os.path.exists(abs_local_path):
                                         print(f"[VERIFY] Local file not found: {abs_local_path}")
-                                        return {"orb": 0, "color": 0.0}
+                                        return {"orb": 0, "correlation": 0.0}
                                     img1_bgr = cv2.imread(abs_local_path, cv2.IMREAD_COLOR)
                                 
-                                if img1_bgr is None: return {"orb": 0, "color": 0.0}
+                                if img1_bgr is None: return {"orb": 0, "correlation": 0.0}
 
                                 # Read the current scan frame in color
                                 img2_bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
-                                if img2_bgr is None: return {"orb": 0, "color": 0.0}
+                                if img2_bgr is None: return {"orb": 0, "correlation": 0.0}
                                 
-                                # 1. Calculate HSV Color Similarity
-                                color_sim = 0.0
-                                try:
-                                    hsv1 = cv2.cvtColor(img1_bgr, cv2.COLOR_BGR2HSV)
-                                    hsv2 = cv2.cvtColor(img2_bgr, cv2.COLOR_BGR2HSV)
-                                    # H and S channels histogram
-                                    hist1 = cv2.calcHist([hsv1], [0, 1], None, [50, 60], [0, 180, 0, 256])
-                                    hist2 = cv2.calcHist([hsv2], [0, 1], None, [50, 60], [0, 180, 0, 256])
-                                    cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
-                                    cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
-                                    color_sim = float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL))
-                                    color_sim = max(0.0, color_sim)
-                                except Exception as hist_err:
-                                    print(f"[HIST ERROR] {hist_err}")
-                                
-                                # 2. Convert to grayscale for ORB keypoint matching
+                                # Convert to grayscale for feature matching
                                 img1_gray = cv2.cvtColor(img1_bgr, cv2.COLOR_BGR2GRAY)
                                 img2_gray = cv2.cvtColor(img2_bgr, cv2.COLOR_BGR2GRAY)
                                 
-                                orb = cv2.ORB_create(nfeatures=500)
+                                # Use higher features for better target alignment in cluttered scans
+                                orb = cv2.ORB_create(nfeatures=1500)
                                 kp1, des1 = orb.detectAndCompute(img1_gray, None)
                                 kp2, des2 = orb.detectAndCompute(img2_gray, None)
                                 
                                 inliers = 0
+                                correlation = 0.0
                                 if des1 is not None and des2 is not None:
                                     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
                                     matches = bf.knnMatch(des1, des2, k=2)
@@ -1134,61 +1122,92 @@ async def scan_frame(
                                         M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ORB_RANSAC_REPROJ)
                                         if M is not None:
                                             inliers = int(np.sum(mask))
+                                            
+                                            # Warp current frame using inverse homography to align with template coordinates
+                                            h, w, c = img1_bgr.shape
+                                            warped_query = cv2.warpPerspective(img2_bgr, np.linalg.inv(M), (w, h))
+                                            
+                                            # Compare the entire aligned images
+                                            t_resized = cv2.resize(img1_bgr, (300, 300))
+                                            wq_resized = cv2.resize(warped_query, (300, 300))
+                                            
+                                            res = cv2.matchTemplate(wq_resized, t_resized, cv2.TM_CCOEFF_NORMED)
+                                            correlation = float(res[0][0])
                                         else:
                                             inliers = len(good_matches)
                                     else:
                                         inliers = len(good_matches)
                                         
-                                return {"orb": inliers, "color": color_sim}
+                                return {"orb": inliers, "correlation": correlation}
                             except Exception as e:
                                 print(f"[DETAILED SIM ERROR] {e}")
-                                return {"orb": 0, "color": 0.0}
+                                return {"orb": 0, "correlation": 0.0}
 
                         # Compute detailed similarity for Top 1 and Top 2
                         sim1 = await get_detailed_similarity(best_id, temp_path)
                         orb_score1 = sim1["orb"]
-                        color_sim1 = sim1["color"]
+                        correlation1 = sim1.get("correlation", 0.0)
                         
                         rival_id = sorted_candidates[1][0] if len(sorted_candidates) > 1 else None
-                        sim2 = await get_detailed_similarity(rival_id, temp_path) if rival_id else {"orb": 0, "color": 0.0}
+                        sim2 = await get_detailed_similarity(rival_id, temp_path) if rival_id else {"orb": 0, "correlation": 0.0}
                         orb_score2 = sim2["orb"]
-                        color_sim2 = sim2["color"]
+                        correlation2 = sim2.get("correlation", 0.0)
                         
-                        print(f"  [OPENCV] Scores -> Best: ORB={orb_score1}, Color={color_sim1:.3f} | Rival: ORB={orb_score2}, Color={color_sim2:.3f}")
+                        print(f"  [OPENCV ALIGNED] Scores -> Best ({best_id[:8]}): ORB={orb_score1}, Correlation={correlation1:.3f} | Rival ({rival_id[:8] if rival_id else 'None'}): ORB={orb_score2}, Correlation={correlation2:.3f}")
                         
-                        # Disambiguate based on color similarity and keypoint matches.
+                        # Disambiguate based on template cross-correlation and keypoint matches.
                         should_swap = False
                         if rival_id:
-                            # Rule A: If color similarity difference is significant, trust color!
-                            if abs(color_sim1 - color_sim2) >= 0.08:
-                                if color_sim2 > color_sim1:
-                                    print(f"  [COLOR SWAP] Rival has significantly better color match ({color_sim2:.3f} > {color_sim1:.3f})")
+                            # Rule A: If one has a significantly better correlation, trust it! (Checks entire image details)
+                            if abs(correlation1 - correlation2) >= 0.08:
+                                if correlation2 > correlation1:
+                                    print(f"  [CORRELATION SWAP] Rival has significantly better template correlation ({correlation2:.3f} > {correlation1:.3f})")
                                     should_swap = True
-                            # Rule B: If colors are similar, trust ORB keypoint geometric matching
+                            # Rule B: If correlations are close, swap if rival has significantly more keypoints
                             else:
-                                if orb_score2 > orb_score1:
-                                    print(f"  [ORB SWAP] Rival has better keypoint match ({orb_score2} > {orb_score1})")
+                                if orb_score2 > orb_score1 + 10:
+                                    print(f"  [ORB SWAP] Rival has significantly better keypoint match ({orb_score2} > {orb_score1})")
                                     should_swap = True
                                     
                         if should_swap:
                             best_id, rival_id = rival_id, best_id
                             orb_score1, orb_score2 = orb_score2, orb_score1
-                            color_sim1, color_sim2 = color_sim2, color_sim1
+                            correlation1, correlation2 = correlation2, correlation1
                             best_score, second_best_score = second_best_score, best_score
                             score_gap = best_score - second_best_score
                             ai_gate_passed = True
+                            
+                        # Check for ambiguity (same logo / template conflict)
+                        is_ambiguous = False
+                        if rival_id:
+                            # If both templates have high similarity and are very close, it means they share the same logo/template
+                            # and we cannot safely distinguish them. In this case, we skip/ignore it.
+                            if correlation1 >= 0.55 and correlation2 >= 0.55:
+                                if abs(correlation1 - correlation2) < 0.08 and abs(orb_score1 - orb_score2) < 10:
+                                    is_ambiguous = True
+                                    print(f"  [AMBIGUOUS] Same logo/template detected with close scores ({correlation1:.3f} vs {correlation2:.3f}). Skipping match to avoid conflict.")
                         
                         # 3. Watermark Check
                         is_watermarked = check_watermark_presence(temp_path)
                         
-                        # Accept if AI gate passed AND (high confidence or ORB verified)
-                        # OR if it's an extremely high confidence AI match (best_score >= 0.50) bypassing the gate
-                        if (best_score >= 0.50) or (
+                        # Accept if template alignment correlation is high (meaning a direct visual match of entire image)
+                        # OR if original AI gate passes (and is not ambiguous)
+                        is_match = False
+                        if is_ambiguous:
+                            print(f"  [REJECTED] Ambiguous match (same logo conflict). Skipping.")
+                        elif (orb_score1 >= 15 and correlation1 >= 0.65):
+                            is_match = True
+                            print(f"  [VERIFICATION] High confidence aligned template match! correlation={correlation1:.3f}, inliers={orb_score1}")
+                        elif (best_score >= 0.50) or (
                             ai_gate_passed and (
                                 best_score >= HIGH_CONFIDENCE_RELAX
                                 or (orb_score1 > orb_score2 and orb_score1 >= ORB_THRESHOLD)
                             )
                         ):
+                            is_match = True
+                            print(f"  [VERIFIED] Identity confirmed by AI Gate: {best_id[:12]}")
+                            
+                        if is_match:
                             if ENFORCE_WATERMARK and not is_watermarked:
                                 return ScanResponse(
                                     matchFound=False, 
@@ -1198,8 +1217,6 @@ async def scan_frame(
                                 )
                             if not is_watermarked:
                                 print("  [WATERMARK] Not detected, but allowed (ENFORCE_WATERMARK=False).")
-                            is_match = True
-                            print(f"  [VERIFIED] Identity confirmed: {best_id[:12]}")
                         else:
                             print(f"  [REJECTED] Verification failed.")
                             print(f"  [REJECTED] Too much ambiguity even for OpenCV.")
@@ -1224,6 +1241,8 @@ async def scan_frame(
                         content_id = best_id
                         score = best_score
                         img_col = get_images_collection()
+                        if img_col is None:
+                            return ScanResponse(matchFound=False, confidence=0, matchPercentage=0, message="Database connection unavailable")
                         doc = await img_col.find_one({"contentId": content_id})
                         if doc:
                             print(f"  [FINAL MATCH] {content_id}")
