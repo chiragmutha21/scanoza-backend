@@ -926,6 +926,8 @@ async def scan_frame(
         with open(temp_path, "wb") as f:
             f.write(content)
 
+        is_watermarked = check_watermark_presence(temp_path)
+
         # 1. DCT/QIM invisible watermark fast-track. This is the exact identity
         # layer that differentiates visually identical uploaded targets.
         dct_matched_doc = None
