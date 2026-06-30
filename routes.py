@@ -28,7 +28,7 @@ import tempfile
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Body
 from typing import Optional, List
 
-from database import get_images_collection, get_attached_contents_collection, get_products_collection, get_orders_collection, get_website_users_collection
+from database import get_images_collection, get_attached_contents_collection, get_products_collection, get_orders_collection, get_website_users_collection, _is_mock
 from models import (
     ARContentResponse, UploadResponse, VideoLookupResponse, ErrorResponse,
     AttachedContentResponse, AttachContentRequest, ALLOWED_CONTENT_TYPES,
@@ -516,6 +516,18 @@ async def upload_content(
             os.remove(abs_image_path)
         raise HTTPException(status_code=500, detail=f"Failed to extract augmented embeddings: {str(e)}")
 
+    # Upload target image to Cloudinary so it's globally accessible for any remote server instance to sync
+    if not _is_mock:
+        cloud_image_url = _upload_to_cloudinary(abs_image_path, resource_type="image", folder="targets")
+        if not cloud_image_url:
+            if os.path.exists(abs_image_path):
+                os.remove(abs_image_path)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to upload target image to Cloudinary. Please check Cloudinary configuration/network."
+            )
+        image_path = cloud_image_url
+
     # Save metadata to MongoDB
     doc = {
         "contentId": content_id,
@@ -757,9 +769,35 @@ async def search_similar(content_id: str, k: int = 5):
     if not doc:
         raise HTTPException(status_code=404, detail="Content not found")
 
-    abs_image_path = os.path.join(os.getcwd(), doc["imagePath"].lstrip("/"))
-    embedding = extract_embedding(abs_image_path)
-    results = faiss_index.search(embedding, k=k)
+    image_path = doc.get("imagePath", "")
+    abs_path = None
+    if image_path.startswith("http"):
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(image_path, timeout=15)
+                if resp.status_code == 200:
+                    ext = os.path.splitext(image_path.split("?")[0])[1] or ".jpg"
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext, dir=UPLOAD_DIR)
+                    tmp.write(resp.content)
+                    tmp.close()
+                    abs_path = tmp.name
+        except Exception as e:
+            print(f"Download error in search: {e}")
+    else:
+        abs_path = os.path.join(os.getcwd(), image_path.lstrip("/"))
+        if not os.path.exists(abs_path):
+            abs_path = None
+
+    if not abs_path:
+        raise HTTPException(status_code=400, detail="Image file not found locally or failed to download")
+
+    try:
+        embedding = extract_embedding(abs_path)
+        results = faiss_index.search(embedding, k=k)
+    finally:
+        if image_path.startswith("http") and os.path.exists(abs_path):
+            os.remove(abs_path)
 
     return {
         "query": content_id,
