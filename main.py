@@ -3,6 +3,7 @@ FastAPI application entry point for the AR Image Recognition system.
 """
 import os
 import traceback
+import tempfile
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -48,10 +49,13 @@ async def _sync_faiss_from_db():
     stale_ids = faiss_ids - db_ids
     missing_ids = db_ids - faiss_ids
 
+    print(f"FAISS: {len(faiss_ids)} entries | DB: {len(db_ids)} entries")
+    print(f"  Stale (in FAISS, not DB): {len(stale_ids)} | Missing (in DB, not FAISS): {len(missing_ids)}")
+
     needs_rebuild = len(stale_ids) > 0 or len(missing_ids) > 0
 
     if not needs_rebuild:
-        print("[OK] FAISS index is in sync")
+        print(f"[OK] FAISS index is in sync ({fi_module.total} entries)")
         return
 
     # Full rebuild needed
@@ -79,20 +83,114 @@ async def _sync_faiss_from_db():
     for doc in db_docs:
         content_id = doc.get("contentId")
         image_path = doc.get("imagePath", "")
-        if image_path:
+        abs_path = None
+
+        if image_path.startswith("http"):
             try:
-                embedding = extract_embedding(image_path)
+                import httpx
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(image_path, timeout=15)
+                    if resp.status_code == 200:
+                        ext = os.path.splitext(image_path.split("?")[0])[1] or ".jpg"
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext, dir=UPLOAD_DIR)
+                        tmp.write(resp.content)
+                        tmp.close()
+                        abs_path = tmp.name
+                    else:
+                        print(f"  [WARN] Download failed for {content_id}: HTTP {resp.status_code}")
+            except Exception as e:
+                print(f"  [WARN] Download error for {content_id}: {e}")
+        else:
+            abs_path = os.path.join(os.getcwd(), image_path.lstrip("/"))
+            if not os.path.exists(abs_path):
+                print(f"  [WARN] Local file missing for {content_id}: {abs_path}")
+                abs_path = None
+
+        if abs_path:
+            try:
+                embedding = extract_embedding(abs_path)
                 new_index.add(embedding, content_id)
                 indexed += 1
+                print(f"  [OK] Indexed: {content_id} ({doc.get('originalImageName', '?')})")
             except Exception as e:
                 print(f"  [FAIL] Embedding failed for {content_id}: {e}")
+            finally:
+                if image_path.startswith("http") and os.path.exists(abs_path):
+                    os.remove(abs_path)
 
     # Replace the global faiss_index in routes module
     import routes
     routes.faiss_index = new_index
     print(f"[SYNC] Rebuild complete: {indexed}/{len(db_docs)} images indexed")
-    print("[OK] FAISS index is in sync")
 
+
+async def _sync_order_hashes():
+    """
+    On startup, check if there are any orders with framePhoto but missing framePhotoHash or framePhotoDHash,
+    download them, compute hashes, and save them.
+    """
+    from database import get_orders_collection
+    from routes import calculate_file_hash, calculate_image_dhash
+    import httpx
+    
+    col = get_orders_collection()
+    if col is None:
+        return
+        
+    cursor = col.find({
+        "framePhoto": {"$exists": True, "$ne": ""},
+        "$or": [
+            {"framePhotoHash": {"$exists": False}},
+            {"framePhotoHash": ""},
+            {"framePhotoDHash": {"$exists": False}},
+            {"framePhotoDHash": ""}
+        ]
+    })
+    
+    orders_to_sync = []
+    async for doc in cursor:
+        orders_to_sync.append(doc)
+        
+    if not orders_to_sync:
+        return
+        
+    print(f"[SYNC] Found {len(orders_to_sync)} orders missing framePhoto hashes. Syncing...")
+    
+    async with httpx.AsyncClient() as client:
+        for doc in orders_to_sync:
+            order_id = doc.get("orderId")
+            photo_url = doc.get("framePhoto")
+            
+            # Download photo to a temp file
+            try:
+                if photo_url.startswith("http"):
+                    resp = await client.get(photo_url, timeout=20)
+                    if resp.status_code == 200:
+                        ext = os.path.splitext(photo_url.split("?")[0])[1] or ".jpg"
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                            tmp.write(resp.content)
+                            tmp_path = tmp.name
+                    else:
+                        print(f"  [WARN] Download failed for order {order_id} photo: {resp.status_code}")
+                        continue
+                else:
+                    tmp_path = os.path.join(os.getcwd(), photo_url.lstrip("/"))
+                    if not os.path.exists(tmp_path):
+                        continue
+                        
+                file_hash = calculate_file_hash(tmp_path)
+                dhash = calculate_image_dhash(tmp_path)
+                
+                await col.update_one(
+                    {"orderId": order_id},
+                    {"$set": {"framePhotoHash": file_hash, "framePhotoDHash": dhash}}
+                )
+                print(f"  [OK] Hash synced for order {order_id}")
+                
+                if photo_url.startswith("http") and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception as e:
+                print(f"  [FAIL] Hash sync error for order {order_id}: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -108,6 +206,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[WARN] FAISS sync failed (non-fatal): {e}")
         traceback.print_exc()
+
+    # Sync order hashes
+    try:
+        await _sync_order_hashes()
+    except Exception as e:
+        print(f"[WARN] Order hashes sync failed (non-fatal): {e}")
 
     print("Server ready.")
     yield
@@ -154,9 +258,6 @@ app.add_middleware(
         f"http://{local_ip}.nip.io:3002",
         f"http://{local_ip}.nip.io:3003",
         f"http://{local_ip}.nip.io:5000",
-        "http://localhost",
-        "https://localhost",
-        "capacitor://localhost",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -188,7 +289,7 @@ app.include_router(router)
 
 @app.get("/")
 async def root():
-    return {"name": "AR Image Recognition System", "version": "1.1.0", "docs": "/docs"}
+    return {"name": "AR Image Recognition System", "version": "1.1.0"}
 
 if __name__ == "__main__":
     import uvicorn

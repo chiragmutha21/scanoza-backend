@@ -53,7 +53,7 @@ class ErrorResponse(BaseModel):
 
 # ── Step 2: Multi-content attachment models ────────────────────────────────
 
-ALLOWED_CONTENT_TYPES = ["video", "audio", "image", "text", "pdf"]
+ALLOWED_CONTENT_TYPES = ["video", "audio", "image", "text", "pdf", "link"]
 
 
 class AttachedContentResponse(BaseModel):

@@ -130,21 +130,39 @@ class FaissIndex:
         return results
 
     def remove(self, content_id: str) -> bool:
-        if content_id not in self.id_to_idx: return False
-        
-        # Simple rebuild logic for small datasets
-        n = self.index.ntotal
-        if n <= 1:
-            if self.is_numpy: self.index = NumpyFlatIndex(EMBEDDING_DIM)
-            else: self.index = faiss.IndexFlatIP(EMBEDDING_DIM)
-            self.id_to_idx.clear(); self.idx_to_id.clear(); self._next_idx = 0
-            self.save()
-            return True
+        if content_id not in self.id_to_idx and content_id not in self.idx_to_id.values():
+            return False
 
-        # Reconstruct and filter
-        # (Assuming small scale for WebAR POC)
-        # Note: In production, you'd pull from DB to rebuild index
-        return False # Placeholder for complex rebuild
+        kept: list[tuple[str, np.ndarray]] = []
+        for idx in range(self.index.ntotal):
+            mapped_id = self.idx_to_id.get(idx)
+            if not mapped_id or mapped_id == content_id:
+                continue
+
+            if self.is_numpy:
+                vector = self.index.vectors[idx].copy()
+            else:
+                vector = self.index.reconstruct(idx)
+            kept.append((mapped_id, vector.astype(np.float32)))
+
+        if self.is_numpy:
+            self.index = NumpyFlatIndex(EMBEDDING_DIM)
+        else:
+            self.index = faiss.IndexFlatIP(EMBEDDING_DIM)
+
+        self.id_to_idx.clear()
+        self.idx_to_id.clear()
+        self._next_idx = 0
+
+        for mapped_id, vector in kept:
+            self.index.add(vector.reshape(1, -1))
+            idx = self._next_idx
+            self.id_to_idx[mapped_id] = idx
+            self.idx_to_id[idx] = mapped_id
+            self._next_idx += 1
+
+        self.save()
+        return True
 
     @property
     def total(self) -> int: return self.index.ntotal

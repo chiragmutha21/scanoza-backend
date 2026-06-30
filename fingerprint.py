@@ -94,11 +94,20 @@ def apply_dct_frequency_shift(img: Image.Image, content_id: str) -> Image.Image:
                 
     return Image.fromarray(np.clip(altered_np, 0, 255).astype(np.uint8))
 
+def convert_to_rgb_with_white_bg(img: Image.Image) -> Image.Image:
+    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+        alpha = img.convert('RGBA').split()[-1]
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        bg.paste(img, mask=alpha)
+        return bg.convert('RGB')
+    return img.convert('RGB')
+
 def apply_forced_uniqueness(image_path: str, content_id: str, techniques=['A', 'B']) -> Image.Image:
     """
     Master function to apply selected uniqueness techniques.
     """
-    img = Image.open(image_path).convert("RGB")
+    img = Image.open(image_path)
+    img = convert_to_rgb_with_white_bg(img)
     
     if 'A' in techniques:
         img = apply_micro_geometric_warp(img, content_id)

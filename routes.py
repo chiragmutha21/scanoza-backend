@@ -14,9 +14,10 @@ Step 2 (Attach Multimedia Content):
   DELETE /api/attached-content/{id}     — Delete a specific attachment
 """
 import os
-import re
 import uuid
 import shutil
+import re
+import secrets
 from datetime import datetime, timezone
 import numpy as np
 import hashlib
@@ -27,17 +28,26 @@ import tempfile
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Body
 from typing import Optional, List
 
-from database import get_images_collection, get_attached_contents_collection
+from database import get_images_collection, get_attached_contents_collection, get_products_collection, get_orders_collection, get_website_users_collection
 from models import (
     ARContentResponse, UploadResponse, VideoLookupResponse, ErrorResponse,
     AttachedContentResponse, AttachContentRequest, ALLOWED_CONTENT_TYPES,
     ScanResponse
 )
+import json
 from embeddings import extract_embedding, extract_robust_embeddings, extract_augmented_embeddings, EMBEDDING_DIM
 import faiss_index
 from dotenv import load_dotenv
 from stegano import lsb
 from fingerprint import apply_forced_uniqueness
+from invisible_watermark import (
+    DEFAULT_REPETITIONS,
+    DEFAULT_STRENGTH,
+    WATERMARK_VERSION,
+    embed_watermark,
+    expected_watermark_score,
+    extract_watermark,
+)
 
 load_dotenv()
 
@@ -51,9 +61,12 @@ cloudinary.config(
     api_secret=os.getenv('CLOUDINARY_API_SECRET')
 )
 
-def _upload_to_cloudinary(file_path: str, resource_type: str = "auto") -> str:
+def _upload_to_cloudinary(file_path: str, resource_type: str = "auto", folder: str = None) -> str:
     try:
-        response = cloudinary.uploader.upload(file_path, resource_type=resource_type)
+        kwargs = {"resource_type": resource_type}
+        if folder:
+            kwargs["folder"] = folder
+        response = cloudinary.uploader.upload(file_path, **kwargs)
         return response.get("secure_url")
     except Exception as e:
         print(f"Cloudinary upload failed: {e}")
@@ -94,6 +107,8 @@ AI_MATCH_THRESHOLD = 0.22         # Final weighted confidence needed for candida
 AI_GAP_THRESHOLD = 0.03           # Top-1 minus Top-2 minimum margin (highly relaxed for unique database items)
 AI_MIN_SCAN_THRESHOLD = 0.15      # Minimum raw AI score to consider any match
 ORB_THRESHOLD = 6                 # Minimum ORB verification score
+LEGACY_AI_STRICT_THRESHOLD = 0.60 # Old non-watermarked targets need stronger visual proof
+LEGACY_ORB_THRESHOLD = 25         # Strong ORB gate for legacy targets to prevent false positives
 VOTE_WEIGHT = 0.30                # Weight for vote consistency
 MAX_SCORE_WEIGHT = 0.50           # Weight for max score
 AVG_SCORE_WEIGHT = 0.20           # Weight for average score
@@ -103,6 +118,38 @@ ORB_RATIO_TEST = 0.75             # Lowe ratio test threshold
 ORB_RANSAC_REPROJ = 5.0           # Homography reprojection threshold
 ENFORCE_WATERMARK = False         # Keep false for cross-device reliability (Android/iPhone)
 router = APIRouter(prefix="/api")
+
+DUPLICATE_GROUP_REJECT_MESSAGE = (
+    "This image has multiple Scanoza memories. Please scan the Scanoza-generated print clearly."
+)
+
+
+async def _duplicate_group_count(collection, doc: dict) -> int:
+    """Return how many content records share this source image family."""
+    if not doc:
+        return 0
+    source_group_id = doc.get("sourceGroupId") or doc.get("originalImageHash")
+    if not source_group_id:
+        return 1
+    return await collection.count_documents({
+        "$or": [
+            {"sourceGroupId": source_group_id},
+            {"originalImageHash": source_group_id},
+        ]
+    })
+
+
+async def _is_duplicate_group(collection, doc: dict) -> bool:
+    return await _duplicate_group_count(collection, doc) > 1
+
+
+def _reject_duplicate_group(best_score: float) -> ScanResponse:
+    return ScanResponse(
+        matchFound=False,
+        confidence=float(best_score),
+        matchPercentage=int(max(0.0, min(best_score, 1.0)) * 100),
+        message=DUPLICATE_GROUP_REJECT_MESSAGE,
+    )
 
 # ── FAISS index (singleton) ────────────────────────────────────────────────
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "data/faiss_index.bin")
@@ -120,135 +167,6 @@ def _ensure_dirs():
 
 
 _ensure_dirs()
-
-
-def _normalize_email(email: Optional[str]) -> Optional[str]:
-    if not email:
-        return None
-    return email.strip().lower()
-
-
-def _remove_file_if_exists(file_path: str):
-    try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-    except Exception as e:
-        print(f"Failed to remove file {file_path}: {e}")
-
-
-def _calculate_image_dhash(image_path: str, hash_size: int = 8) -> str:
-    try:
-        with PILImage.open(image_path) as img:
-            # Resize to (hash_size + 1, hash_size), grayscale
-            img = img.convert('L').resize((hash_size + 1, hash_size), PILImage.Resampling.LANCZOS)
-            pixels = list(img.getdata())
-            
-            # Compute difference between adjacent pixels
-            diff = []
-            for row in range(hash_size):
-                for col in range(hash_size):
-                    pixel_left = pixels[row * (hash_size + 1) + col]
-                    pixel_right = pixels[row * (hash_size + 1) + col + 1]
-                    diff.append(pixel_left > pixel_right)
-            
-            # Convert binary array to hex string
-            decimal_value = 0
-            hex_string = []
-            for index, value in enumerate(diff):
-                if value:
-                    decimal_value += 2**(index % 8)
-                if (index % 8) == 7:
-                    hex_string.append(hex(decimal_value)[2:].zfill(2))
-                    decimal_value = 0
-            return "".join(hex_string)
-    except Exception as e:
-        print(f"Error calculating dhash: {e}")
-        return ""
-
-
-async def _find_duplicate_target(collection, image_hash: str, image_dhash: str):
-    if not image_hash and not image_dhash:
-        return None
-    
-    query = {"$or": []}
-    if image_hash:
-        query["$or"].append({"originalImageHash": image_hash})
-    if image_dhash:
-        query["$or"].append({"originalImageDHash": image_dhash})
-        
-    try:
-        doc = await collection.find_one(query)
-        return doc
-    except Exception as e:
-        print(f"Error finding duplicate target: {e}")
-        return None
-
-
-async def _is_actual_duplicate(img_path_1: str, img_path_2_or_url: str) -> bool:
-    """
-    Performs a strict pixel-level and ORB similarity check between two images.
-    Returns True only if they are virtually identical (same image).
-    Allows visually similar templates (like IN and OUT) to be uploaded.
-    """
-    try:
-        # Load image 1 (local path)
-        img1 = cv2.imread(img_path_1, cv2.IMREAD_GRAYSCALE)
-        if img1 is None:
-            return False
-            
-        # Load image 2 (local path or URL)
-        if img_path_2_or_url.startswith("http"):
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(img_path_2_or_url)
-                if resp.status_code != 200:
-                    return False
-                img2_data = np.frombuffer(resp.content, np.uint8)
-                img2 = cv2.imdecode(img2_data, cv2.IMREAD_GRAYSCALE)
-        else:
-            local_path = img_path_2_or_url.replace('/uploads/', 'uploads/').lstrip("/")
-            # Remove leading slash or backslash
-            local_path = re.sub(r'^[/\\]+', '', local_path)
-            abs_local_path = os.path.join(os.getcwd(), local_path)
-            if not os.path.exists(abs_local_path):
-                return False
-            img2 = cv2.imread(abs_local_path, cv2.IMREAD_GRAYSCALE)
-            
-        if img2 is None:
-            return False
-            
-        # Resize to same dimensions for comparison
-        h1, w1 = img1.shape
-        img2 = cv2.resize(img2, (w1, h1))
-        
-        # Calculate Mean Squared Error (MSE)
-        err = np.sum((img1.astype("float") - img2.astype("float")) ** 2)
-        err /= float(img1.shape[0] * img1.shape[1])
-        
-        # If the pixel error is extremely low, they are identical
-        if err < 50.0:
-            return True
-            
-        # Also run ORB to check keypoint correspondence
-        orb = cv2.ORB_create(nfeatures=500)
-        kp1, des1 = orb.detectAndCompute(img1, None)
-        kp2, des2 = orb.detectAndCompute(img2, None)
-        
-        if des1 is None or des2 is None:
-            return False
-            
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        matches = bf.match(des1, des2)
-        
-        match_ratio = len(matches) / min(len(kp1), len(kp2))
-        
-        # If almost all keypoints match exactly and MSE is low, they are duplicates
-        if err < 1500.0 and match_ratio > 0.90:
-            return True
-            
-        return False
-    except Exception as e:
-        print(f"Error checking actual duplicate: {e}")
-        return False
 
 
 @router.get("/debug/status")
@@ -297,6 +215,14 @@ async def _save_upload(file: UploadFile, subfolder: str) -> tuple[str, str]:
     return relative_path, unique_name
 
 
+def convert_to_rgb_with_white_bg(img: PILImage.Image) -> PILImage.Image:
+    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+        alpha = img.convert('RGBA').split()[-1]
+        bg = PILImage.new("RGBA", img.size, (255, 255, 255, 255))
+        bg.paste(img, mask=alpha)
+        return bg.convert('RGB')
+    return img.convert('RGB')
+
 def _add_watermark(image_path: str):
     """Adds a 'SCANOZA TARGET' watermark to the image for user feedback."""
     try:
@@ -323,7 +249,7 @@ def _add_watermark(image_path: str):
             draw.text((width - 150, height - 30), text, fill=(255, 255, 255, 128), font=font)
             
             watermarked = PILImage.alpha_composite(img, txt)
-            watermarked = watermarked.convert("RGB") # Convert back to JPEG compatible
+            watermarked = convert_to_rgb_with_white_bg(watermarked) # Convert back to JPEG compatible
             watermarked.save(abs_path, "JPEG", quality=95)
             print(f"Watermark added to {abs_path}")
     except Exception as e:
@@ -335,7 +261,8 @@ def apply_stealth_noise(image_path: str, seed_str: str, intensity: float = 12.0)
     The noise survives real-world camera scanning by being low frequency (smooth).
     """
     try:
-        img = PILImage.open(image_path).convert("RGB")
+        img = PILImage.open(image_path)
+        img = convert_to_rgb_with_white_bg(img)
         img_np = np.array(img, dtype=np.float32)
         height, width, _ = img_np.shape
 
@@ -357,6 +284,53 @@ def apply_stealth_noise(image_path: str, seed_str: str, intensity: float = 12.0)
         print(f"Stealth noise applied to {image_path} with seed {seed_str}")
     except Exception as e:
         print(f"Failed to apply stealth noise: {e}")
+
+def calculate_file_hash(file_path: str) -> str:
+    """Calculate a stable SHA-256 hash for exact duplicate tracking."""
+    sha = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            sha.update(block)
+    return sha.hexdigest()
+
+def calculate_image_dhash(file_path: str, hash_size: int = 16) -> str:
+    """Calculate a perceptual dHash for visually duplicate target detection."""
+    img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError("Invalid image")
+    resized = cv2.resize(img, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
+    diff = resized[:, 1:] > resized[:, :-1]
+    value = 0
+    for bit in diff.flatten():
+        value = (value << 1) | int(bit)
+    return f"{value:0{(hash_size * hash_size) // 4}x}"
+
+def hamming_distance_hex(left: str, right: str) -> int:
+    """Return bit distance between two equal-length hex hashes."""
+    if not left or not right or len(left) != len(right):
+        return 10**9
+    return (int(left, 16) ^ int(right, 16)).bit_count()
+
+async def find_duplicate_target(collection, original_hash: str, image_dhash: str):
+    """Find an exact or visually near-identical target already stored in MongoDB."""
+    exact_doc = await collection.find_one({"originalImageHash": original_hash})
+    if exact_doc:
+        return exact_doc, "exact_hash", 1.0
+
+    # 16x16 dHash has 256 bits; <= 10 is very strict for same/near-same images.
+    cursor = collection.find({"originalImageDHash": {"$regex": r"^[0-9a-f]+$"}})
+    async for doc in cursor:
+        existing_hash = doc.get("originalImageDHash")
+        distance = hamming_distance_hex(image_dhash, existing_hash)
+        if distance <= 10:
+            score = 1.0 - (distance / 256)
+            return doc, "perceptual_hash", score
+
+    return None, "", 0.0
+
+def remove_file_if_exists(path: str):
+    if path and os.path.exists(path):
+        os.remove(path)
 
 def check_image_quality(image_path: str) -> dict:
     """
@@ -424,18 +398,11 @@ async def upload_content(
     title: Optional[str] = Form(""),
     file: Optional[UploadFile] = File(None),
     url: Optional[str] = Form(None),
-    videoLink: Optional[str] = Form(None),
     text: Optional[str] = Form(None),
     user_email: Optional[str] = Form(None),
 ):
     print(f"POST /api/upload received: image={image.filename}, type={type}")
-
-    owner_email = _normalize_email(user_email)
-    if not owner_email or "@" not in owner_email:
-        raise HTTPException(
-            status_code=401,
-            detail="Please sign in with Google before uploading content."
-        )
+    normalized_user_email = user_email.strip().lower() if user_email else None
 
     # Validate image type
     if image.content_type and not image.content_type.startswith("image/"):
@@ -443,62 +410,8 @@ async def upload_content(
 
     image_path, image_filename = await _save_upload(image, "images")
     abs_image_path = os.path.join(os.getcwd(), image_path.lstrip("/"))
-
-    collection = get_images_collection()
-    if collection is None:
-        _remove_file_if_exists(abs_image_path)
-        raise HTTPException(
-            status_code=503,
-            detail="Database connection is currently unavailable. Please try again."
-        )
-
-    try:
-        with open(abs_image_path, "rb") as original_file:
-            original_image_hash = hashlib.sha256(original_file.read()).hexdigest()
-        original_image_dhash = _calculate_image_dhash(abs_image_path)
-        duplicate = await _find_duplicate_target(
-            collection, original_image_hash, original_image_dhash
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        _remove_file_if_exists(abs_image_path)
-        raise HTTPException(status_code=400, detail=f"Invalid target image: {exc}")
-
-    is_update = False
-    if duplicate:
-        # Perform deep pixel and ORB validation to verify if this is an actual duplicate
-        dup_image_path = duplicate.get("imagePath", "")
-        is_actual_dup = await _is_actual_duplicate(abs_image_path, dup_image_path)
-        
-        if is_actual_dup:
-            dup_content_id = duplicate.get("contentId")
-            is_missing = False
-            if dup_image_path and not dup_image_path.startswith("http"):
-                abs_dup_path = os.path.join(os.getcwd(), dup_image_path.lstrip("/\\"))
-                if not os.path.exists(abs_dup_path):
-                    is_missing = True
-            
-            if dup_content_id not in faiss_index.id_to_idx:
-                is_missing = True
-
-            if is_missing:
-                print(f"[RE-INDEX] Target {dup_content_id} is missing its file or FAISS index. Updating/Re-indexing.")
-                content_id = dup_content_id
-                is_update = True
-            else:
-                _remove_file_if_exists(abs_image_path)
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "message": "This image already exists in the database. Please upload a different target image.",
-                        "duplicateOfContentId": duplicate.get("contentId"),
-                    },
-                )
-        else:
-            # Not an actual duplicate, just a similar template! Allow it as a new target image.
-            print(f"[UPLOAD] Visually similar template detected but allowed (distinct pixel layout).")
-            duplicate = None
+    original_abs_path = abs_image_path
+    original_hash = calculate_file_hash(original_abs_path)
 
     # QUALITY CHECK (Point 9)
     quality = check_image_quality(abs_image_path)
@@ -506,59 +419,89 @@ async def upload_content(
         if os.path.exists(abs_image_path): os.remove(abs_image_path)
         raise HTTPException(status_code=400, detail=quality["msg"])
     print(f"Image Quality Check: {quality['msg']} ({quality['score']} features)")
+    original_dhash = calculate_image_dhash(original_abs_path)
 
-    if not is_update:
-        # Generate content ID early so we can use it as a seed
-        content_id = str(uuid.uuid4())
+    # Generate content ID early so we can use it as a seed
+    content_id = str(uuid.uuid4())
+    watermark_id = secrets.token_hex(8)
 
-    # ── FORCED UNIQUENESS: Apply invisible alteration before printing ──
+    collection = get_images_collection()
+    if collection is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection is currently unavailable. Please check your MongoDB Altas whitelist/connection."
+        )
+
+    # Detect duplicate source images before any Cloudinary/FAISS/DB writes.
+    # Same target images should not become separate memories.
+    possible_duplicate = False
+    existing_duplicate_id = None
+    duplicate_score = 0.0
+    duplicate_exact_hash = False
     try:
-        forced_img = apply_forced_uniqueness(abs_image_path, content_id, techniques=['A', 'B'])
-        forced_img.save(abs_image_path, "JPEG", quality=95)
-        print(f"[FINGERPRINT] Forced uniqueness applied for {content_id}")
+        duplicate_doc, duplicate_method, duplicate_score = await find_duplicate_target(
+            collection,
+            original_hash,
+            original_dhash,
+        )
+        if duplicate_doc:
+            possible_duplicate = True
+            duplicate_exact_hash = duplicate_method == "exact_hash"
+            existing_duplicate_id = duplicate_doc.get("contentId")
+            print(
+                f"[DUPLICATE] Existing target image rejected: {existing_duplicate_id} "
+                f"method={duplicate_method} score={duplicate_score:.4f}"
+            )
+        elif faiss_index.total > 0:
+            original_embedding = extract_embedding(original_abs_path)
+            duplicate_results = faiss_index.search(original_embedding, k=3)
+            if duplicate_results:
+                existing_duplicate_id, duplicate_score = duplicate_results[0]
+                if duplicate_score >= 0.94:
+                    duplicate_doc = await collection.find_one({"contentId": existing_duplicate_id})
+                    if duplicate_doc:
+                        possible_duplicate = True
+                        print(
+                            f"[DUPLICATE] Visual source match: {existing_duplicate_id} "
+                            f"score={duplicate_score:.4f}"
+                        )
+                    else:
+                        print(
+                            f"[DUPLICATE] Ignoring stale FAISS match: {existing_duplicate_id} "
+                            f"score={duplicate_score:.4f}"
+                        )
     except Exception as e:
-        print(f"[FINGERPRINT ERROR] {e}")
+        print(f"[DUPLICATE] Duplicate check failed: {e}")
 
-    # STEGANOGRAPHY ONLY: Removing visible noise and text watermarks as per user request.
-    # Image will look 100% original to the human eye.
+    if possible_duplicate:
+        remove_file_if_exists(original_abs_path)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "This image already exists in the database. Please upload a different target image.",
+                "duplicateOfContentId": existing_duplicate_id,
+                "duplicateScore": float(duplicate_score),
+            },
+        )
 
-    # Apply Steganography (LSB) to hide `content_id`
-    # Must save as PNG to preserve LSB!
-    png_path = os.path.splitext(abs_image_path)[0] + ".png"
-    try:
-        secret_img = lsb.hide(abs_image_path, content_id)
-        secret_img.save(png_path)
-        if abs_image_path != png_path:
-            os.remove(abs_image_path)
-        abs_image_path = png_path
-        image_path = f"/{UPLOAD_DIR}/images/{os.path.basename(png_path)}"
-        print(f"Invisible Steganography successfully embedded content_id {content_id}")
-    except Exception as e:
-        print(f"Steganography failed: {e}")
-
-    # Cloudinary Upload for target image (Restoring as per user request)
-    # Using the PNG path to preserve the invisible watermark
-    cloud_image_url = _upload_to_cloudinary(abs_image_path, resource_type="image")
-    if not cloud_image_url:
-        raise HTTPException(status_code=500, detail="Cloudinary upload failed.")
-    
-    local_image_path = image_path
-    image_path = cloud_image_url
-    print(f"Watermarked image successfully uploaded to Cloudinary: {cloud_image_url}")
+    # Keep the uploaded target exactly as the user provided it. Do not create a
+    # generated/watermarked copy, because that can alter transparent backgrounds,
+    # dimensions, and visible pixels.
+    watermark_metrics = None
+    print(f"[TARGET] Preserving original uploaded image for {content_id}: {image_path}")
 
     # Save attached content
-    final_url = url or videoLink or ""
+    final_url = url or ""
     final_text = text or ""
     
-    abs_saved_path = None
     if file and file.filename:
         # Determine subfolder based on type
         sub = "videos" if type == "video" else ("audio" if type == "audio" else ("pdfs" if type == "pdf" else "images"))
         saved_path, _ = await _save_upload(file, sub)
         abs_saved_path = os.path.join(os.getcwd(), saved_path.lstrip("/"))
-        cloud_file_url = _upload_to_cloudinary(abs_saved_path, resource_type="auto")
+        cloud_file_url = _upload_to_cloudinary(abs_saved_path, resource_type="auto", folder="uploaded")
         final_url = cloud_file_url if cloud_file_url else saved_path
-    elif type != "text" and not final_url:
+    elif type != "text" and not url:
          raise HTTPException(status_code=400, detail=f"A file or URL is required for type '{type}'")
 
     # Extract deep learning embeddings (Augmented for robustness)
@@ -574,90 +517,90 @@ async def upload_content(
         raise HTTPException(status_code=500, detail=f"Failed to extract augmented embeddings: {str(e)}")
 
     # Save metadata to MongoDB
-    if is_update:
-        update_data = {
-            "imagePath": image_path,
-            "localImagePath": local_image_path,
-            "originalImageHash": original_image_hash,
-            "originalImageDHash": original_image_dhash,
-            "userEmail": owner_email,
-            "originalImageName": image.filename or "unknown",
-            "videoPath": final_url, 
-            "videoType": "link" if (url or videoLink) else "file",
-            "type": type,
-            "title": title,
-            "text": final_text,
-            "url": final_url,
-            "createdAt": datetime.now(timezone.utc).isoformat(),
-        }
-        await collection.update_one({"contentId": content_id}, {"$set": update_data})
-        print(f"Updated duplicate document {content_id} with new image & embeddings.")
-    else:
-        doc = {
-            "contentId": content_id,
-            "userEmail": owner_email,
-            "originalImageHash": original_image_hash,
-            "originalImageDHash": original_image_dhash,
-            "originalImageName": image.filename or "unknown",
-            "imagePath": image_path,
-            "localImagePath": local_image_path,
-            # Default/Legacy mapping for front-end
-            "videoPath": final_url, 
-            "videoType": "link" if (url or videoLink) else "file",
-            # New multi-type support
-            "type": type,
-            "title": title,
-            "text": final_text,
-            "url": final_url,
-            "descriptorPath": "",
-            "fingerprintTechniques": ["A", "B"],
-            "metadata": {
-                "keypointsCount": EMBEDDING_DIM,
-                "fileSize": file.size if file and file.size else 0,
-            },
-            "createdAt": datetime.now(timezone.utc).isoformat(),
-        }
-        print(f"Attempting to insert into DB: {doc['contentId']}")
-        await collection.insert_one(doc)
-        print("Insert finished.")
-
-    # Delete local temporary files after successful DB write
-    if os.path.exists(abs_image_path):
-        os.remove(abs_image_path)
-    if abs_saved_path and os.path.exists(abs_saved_path) and final_url.startswith("http"):
-        os.remove(abs_saved_path)
+    doc = {
+        "contentId": content_id,
+        "userEmail": normalized_user_email,
+        "watermarkId": None,
+        "watermarkVersion": None,
+        "watermarkStrength": None,
+        "watermarkRepetitions": None,
+        "originalImageName": image.filename or "unknown",
+        "imagePath": image_path,
+        "originalImageHash": original_hash,
+        "originalImageDHash": original_dhash,
+        "sourceGroupId": original_hash,
+        "isDuplicateSource": possible_duplicate,
+        "duplicateOfContentId": existing_duplicate_id if possible_duplicate else None,
+        "duplicateScore": float(duplicate_score),
+        "duplicateExactHash": duplicate_exact_hash,
+        # Default/Legacy mapping for front-end
+        "videoPath": final_url, 
+        "videoType": "link" if url else "file",
+        # New multi-type support
+        "type": type,
+        "title": title,
+        "text": final_text,
+        "url": final_url,
+        "descriptorPath": "",
+        "fingerprintTechniques": [],
+        "qualityMetrics": {
+            "psnr": watermark_metrics.psnr if watermark_metrics else None,
+            "ssim": watermark_metrics.ssim if watermark_metrics else None,
+        },
+        "metadata": {
+            "keypointsCount": EMBEDDING_DIM,
+            "fileSize": file.size if file and file.size else 0,
+        },
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+    print(f"Attempting to insert into DB: {doc['contentId']}")
+    await collection.insert_one(doc)
+    print("Insert finished.")
 
     # Build response URLs
     base_url = str(request.base_url).rstrip("/")
     video_url = final_url if final_url.startswith("http") else f"{base_url}{final_url}"
     full_image_url = image_path if image_path.startswith("http") else f"{base_url}{image_path}"
+    message = "Upload successful. Your original target image was preserved without visual changes."
 
     return {
-        "message": "Upload successful",
+        "message": message,
         "contentId": content_id,
         "videoUrl": video_url,
         "imageUrl": full_image_url,
         "descriptorUrl": "",
+        "isDuplicateSource": possible_duplicate,
+        "duplicateOfContentId": existing_duplicate_id if possible_duplicate else None,
+        "duplicateScore": float(duplicate_score),
     }
 
 
 @router.get("/contents")
 async def get_all_contents(email: Optional[str] = None):
-    """List only content owned by the supplied logged-in email."""
-    collection = get_images_collection()
-    if collection is None:
-        raise HTTPException(status_code=503, detail="Database connection is currently unavailable.")
+    """List only the logged-in user's content, sorted newest first."""
+    try:
+        collection = get_images_collection()
+        if collection is None:
+            print("[CONTENTS] DB unavailable; returning empty list")
+            return []
+        normalized_email = email.strip().lower() if email else None
+        if not normalized_email:
+            return []
 
-    owner_email = _normalize_email(email)
-    if not owner_email or "@" not in owner_email:
-        raise HTTPException(status_code=401, detail="Google sign-in is required.")
-
-    cursor = collection.find({"userEmail": owner_email}).sort("createdAt", -1)
-    results = []
-    async for doc in cursor:
-        doc["_id"] = str(doc.get("_id", ""))
-        results.append(doc)
-    return results
+        cursor = collection.find({
+            "userEmail": {
+                "$regex": f"^{re.escape(normalized_email)}$",
+                "$options": "i",
+            }
+        }).sort("createdAt", -1)
+        results = []
+        async for doc in cursor:
+            doc["_id"] = str(doc.get("_id", ""))
+            results.append(doc)
+        return results
+    except Exception as e:
+        print(f"[CONTENTS] Failed to load content list: {e}")
+        return []
 
 
 @router.post("/register-user")
@@ -719,7 +662,7 @@ async def update_content(
         sub = "videos" if type == "video" else ("audio" if type == "audio" else ("pdfs" if type == "pdf" else "images"))
         saved_path, _ = await _save_upload(file, sub)
         abs_saved_path = os.path.join(os.getcwd(), saved_path.lstrip("/"))
-        cloud_file_url = _upload_to_cloudinary(abs_saved_path, resource_type="auto")
+        cloud_file_url = _upload_to_cloudinary(abs_saved_path, resource_type="auto", folder="uploaded")
         final_url = cloud_file_url if cloud_file_url else saved_path
     
     update_data = {
@@ -925,13 +868,19 @@ async def attach_content(
 @router.get("/attached-contents/{content_id}")
 async def get_attached_contents(content_id: str):
     """Get all attached contents for an image, sorted by order."""
-    attached_col = get_attached_contents_collection()
-    cursor = attached_col.find({"contentId": content_id}).sort("order", 1)
-    results = []
-    async for doc in cursor:
-        doc["_id"] = str(doc.get("_id", ""))
-        results.append(doc)
-    return results
+    try:
+        attached_col = get_attached_contents_collection()
+        if attached_col is None:
+            return []
+        cursor = attached_col.find({"contentId": content_id}).sort("order", 1)
+        results = []
+        async for doc in cursor:
+            doc["_id"] = str(doc.get("_id", ""))
+            results.append(doc)
+        return results
+    except Exception as e:
+        print(f"[ATTACHMENTS] Failed to load attachments for {content_id}: {e}")
+        return []
 
 
 @router.delete("/attached-content/{attachment_id}")
@@ -954,6 +903,8 @@ async def delete_attached_content(attachment_id: str):
 
     await attached_col.delete_one({"attachmentId": attachment_id})
     return {"message": "Attachment deleted successfully"}
+
+
 @router.post("/scan", response_model=ScanResponse)
 async def scan_frame(
     frame: UploadFile = File(...),
@@ -967,35 +918,72 @@ async def scan_frame(
     os.makedirs(temp_dir, exist_ok=True)
     temp_filename = f"scan_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:8]}.jpg"
     temp_path = os.path.join(temp_dir, temp_filename)
+    is_match = False
+    best_score = 0.0
 
     try:
         content = await frame.read()
         with open(temp_path, "wb") as f:
             f.write(content)
 
-        # 1. Steganography Fast-Track Check (LSB is fragile, but worth a shot)
-        stego_matched_doc = None
+        # 1. DCT/QIM invisible watermark fast-track. This is the exact identity
+        # layer that differentiates visually identical uploaded targets.
+        dct_matched_doc = None
         try:
-            from stegano import lsb
-            revealed = lsb.reveal(temp_path)
-            if revealed and len(revealed) == 36 and '-' in revealed:
-                print(f"[STEGO] Steganography payload detected: {revealed}")
+            watermark_result = extract_watermark(temp_path)
+            if watermark_result.watermark_id:
+                print(
+                    f"[DCT WATERMARK] Decoded {watermark_result.watermark_id} "
+                    f"confidence={watermark_result.confidence:.3f} "
+                    f"agreement={watermark_result.bit_agreement:.3f}"
+                )
                 img_col = get_images_collection()
-                stego_matched_doc = await img_col.find_one({"contentId": revealed})
+                dct_matched_doc = await img_col.find_one({"watermarkId": watermark_result.watermark_id})
+                if not dct_matched_doc:
+                    print(f"[DCT WATERMARK] Decoded ID not found in DB: {watermark_result.watermark_id}")
+            else:
+                print(
+                    f"[DCT WATERMARK] No valid payload "
+                    f"confidence={watermark_result.confidence:.3f} "
+                    f"crc={watermark_result.valid_crc}"
+                )
         except Exception as e:
-            pass
+            print(f"[DCT WATERMARK] Extraction failed: {e}")
+
+        # 2. Legacy LSB compatibility check. New uploads do not depend on this.
+        stego_matched_doc = None
+        if not dct_matched_doc:
+            try:
+                from stegano import lsb
+                revealed = lsb.reveal(temp_path)
+                if revealed and len(revealed) == 36 and '-' in revealed:
+                    print(f"[STEGO] Steganography payload detected: {revealed}")
+                    img_col = get_images_collection()
+                    stego_matched_doc = await img_col.find_one({"contentId": revealed})
+            except Exception:
+                pass
 
         content_id = None
         score = 0.0
+        doc = None
 
-        if stego_matched_doc:
+        if dct_matched_doc:
+            content_id = dct_matched_doc["contentId"]
+            score = max(0.90, float(watermark_result.confidence))
+            best_score = score
+            is_match = True
+            print(f"Scan result: DCT watermark exact match for {content_id}")
+            doc = dct_matched_doc
+        elif stego_matched_doc:
             content_id = stego_matched_doc["contentId"]
             score = 1.0 # Perfect matching
+            best_score = score
+            is_match = True
             print(f"Scan result: Steganography perfect match for {content_id}")
             doc = stego_matched_doc
         else:
-            # 2. Visual Matching Fallback (Robust Multi-Crop ResNet + FAISS)
-            print("LSB failed, attempting robust visual matching...")
+            # 3. Visual Matching Fallback (Robust Multi-Crop ResNet + FAISS)
+            print("Watermark extraction failed, attempting robust visual matching...")
             try:
                 # Use robust multi-crop/enhanced embeddings for scanning
                 query_embeddings = extract_robust_embeddings(temp_path)
@@ -1009,13 +997,17 @@ async def scan_frame(
                 
                 for i, emb in enumerate(query_embeddings):
                     results = faiss_index.search(emb, k=3)
+                    if results:
+                        top_match_id = results[0][0]
+                        candidate_vote_count[top_match_id] = candidate_vote_count.get(top_match_id, 0) + 1
+                    seen_ids = set()
                     for match_id, match_score in results:
+                        if match_id in seen_ids:
+                            continue
+                        seen_ids.add(match_id)
                         # Track max score
                         if match_score > candidate_max_score.get(match_id, 0):
                             candidate_max_score[match_id] = match_score
-                        # Track vote count (each crop gets 1 vote for its top match)
-                        if results and results[0][0] == match_id:  # Top-1 match
-                            candidate_vote_count[match_id] = candidate_vote_count.get(match_id, 0) + 1
                         # Accumulate scores
                         candidate_score_sum[match_id] = candidate_score_sum.get(match_id, 0) + match_score
                 
@@ -1023,7 +1015,47 @@ async def scan_frame(
                     # Identity-First Analysis (High Sensitivity, Zero Mismatch)
                     sorted_candidates = sorted(candidate_max_score.items(), key=lambda x: -x[1])
                     best_id, best_score = sorted_candidates[0]
+
+                    watermark_assisted_pass = False
+                    watermark_scores = {}
+                    best_candidate_doc = None
+                    try:
+                        img_col = get_images_collection()
+                        for candidate_id, _candidate_score in sorted_candidates[:5]:
+                            candidate_doc = await img_col.find_one({"contentId": candidate_id})
+                            candidate_wm = candidate_doc.get("watermarkId") if candidate_doc else None
+                            if candidate_wm:
+                                watermark_scores[candidate_id] = expected_watermark_score(temp_path, candidate_wm)
+                        if watermark_scores:
+                            ranked_wm = sorted(watermark_scores.items(), key=lambda x: -x[1])
+                            wm_best_id, wm_best_score = ranked_wm[0]
+                            wm_second_score = ranked_wm[1][1] if len(ranked_wm) > 1 else 0.0
+                            # Assisted watermark is only a tie-breaker. With a single
+                            # watermarked candidate, do not treat "gap vs zero" as proof.
+                            enough_wm_evidence = (
+                                (len(ranked_wm) > 1 and wm_best_score >= 0.40 and (wm_best_score - wm_second_score) >= 0.08)
+                                or wm_best_score >= 0.62
+                            )
+                            if enough_wm_evidence:
+                                best_id = wm_best_id
+                                best_score = candidate_max_score.get(best_id, best_score)
+                                watermark_assisted_pass = True
+                                print(
+                                    f"  [DCT ASSIST] Candidate watermark selected {best_id[:12]} "
+                                    f"score={wm_best_score:.3f} gap={(wm_best_score - wm_second_score):.3f}"
+                                )
+                            else:
+                                print(f"  [DCT ASSIST] Weak/ambiguous pilot scores: {watermark_scores}")
+                        best_candidate_doc = await img_col.find_one({"contentId": best_id})
+                    except Exception as e:
+                        print(f"  [DCT ASSIST] Scoring failed: {e}")
                     
+                    if best_candidate_doc is None:
+                        img_col = get_images_collection()
+                        best_candidate_doc = await img_col.find_one({"contentId": best_id})
+                    best_has_dct_watermark = bool(best_candidate_doc and best_candidate_doc.get("watermarkId"))
+                    best_is_duplicate_group = await _is_duplicate_group(img_col, best_candidate_doc)
+
                     second_best_score = sorted_candidates[1][1] if len(sorted_candidates) > 1 else 0.0
                     score_gap = best_score - second_best_score
                     single_target_mode = len(candidate_max_score) == 1 and faiss_index.total == 1
@@ -1040,7 +1072,7 @@ async def scan_frame(
                         + (vote_ratio * VOTE_WEIGHT)
                     )
                     has_required_votes = vote_ratio >= MIN_VOTE_RATIO
-                    has_required_gap = single_target_mode or (score_gap >= AI_GAP_THRESHOLD)
+                    has_required_gap = watermark_assisted_pass or single_target_mode or (score_gap >= AI_GAP_THRESHOLD) or (best_score >= LEGACY_AI_STRICT_THRESHOLD)
                     ai_gate_passed = (
                         best_score >= AI_MIN_SCAN_THRESHOLD
                         and weighted_score >= AI_MATCH_THRESHOLD
@@ -1168,8 +1200,6 @@ async def scan_frame(
                             if correlation2 > correlation1 + 0.08 and orb_score2 >= 15:
                                 print(f"  [CORRELATION SWAP] Rival has significantly better template correlation ({correlation2:.3f} > {correlation1:.3f})")
                                 should_swap = True
-                            else:
-                                should_swap = False
                                     
                         if should_swap:
                             best_id, rival_id = rival_id, best_id
@@ -1178,6 +1208,10 @@ async def scan_frame(
                             best_score, second_best_score = second_best_score, best_score
                             score_gap = best_score - second_best_score
                             ai_gate_passed = True
+                            # Reload candidate doc for swapped ID
+                            best_candidate_doc = await img_col.find_one({"contentId": best_id})
+                            best_has_dct_watermark = bool(best_candidate_doc and best_candidate_doc.get("watermarkId"))
+                            best_is_duplicate_group = await _is_duplicate_group(img_col, best_candidate_doc)
                             
                         # Check for ambiguity (same logo / template conflict)
                         is_ambiguous = False
@@ -1187,29 +1221,37 @@ async def scan_frame(
                             if correlation1 >= 0.55 and correlation2 >= 0.55:
                                 if abs(correlation1 - correlation2) < 0.08 and abs(orb_score1 - orb_score2) < 10:
                                     is_ambiguous = True
-                                    print(f"  [AMBIGUOUS] Same logo/template detected with close scores ({correlation1:.3f} vs {correlation2:.3f}). Skipping match to avoid conflict.")
-                        
-                        # 3. Watermark Check
-                        is_watermarked = check_watermark_presence(temp_path)
-                        
-                        # Accept if template alignment correlation is high (meaning a direct visual match of entire image)
-                        # OR if original AI gate passes (and is not ambiguous)
-                        is_match = False
+                                    print(f"  [AMBIGUOUS] Same logo/template detected with close scores ({correlation1:.3f} vs {correlation2:.3f}). Skipping match")
+                        # Accept match logic
+                        high_confidence_visual_match = (best_score >= 0.60 and orb_score1 >= 25)
+                        accept_match = False
                         if is_ambiguous:
                             print(f"  [REJECTED] Ambiguous match (same logo conflict). Skipping.")
-                        elif (orb_score1 >= 15 and correlation1 >= 0.65):
-                            is_match = True
-                            print(f"  [VERIFICATION] High confidence aligned template match! correlation={correlation1:.3f}, inliers={orb_score1}")
-                        elif (best_score >= 0.50) or (
-                            ai_gate_passed and (
-                                best_score >= HIGH_CONFIDENCE_RELAX
-                                or (orb_score1 > orb_score2 and orb_score1 >= ORB_THRESHOLD)
+                        elif high_confidence_visual_match:
+                            # If we have an extremely strong visual match (high AI score + high ORB geometry matches),
+                            # we accept it to prevent false negatives from print/scan distortion or unwatermarked uploads.
+                            accept_match = True
+                        elif best_has_dct_watermark:
+                            # For watermarked targets, never show output on visual
+                            # similarity alone. Blind DCT exact match already returned
+                            # above; this fallback needs assisted DCT plus ORB geometry.
+                            accept_match = (
+                                ai_gate_passed
+                                and watermark_assisted_pass
+                                and orb_score1 > orb_score2
+                                and orb_score1 >= ORB_THRESHOLD
                             )
-                        ):
-                            is_match = True
-                            print(f"  [VERIFIED] Identity confirmed by AI Gate: {best_id[:12]}")
-                            
-                        if is_match:
+                        else:
+                            # Legacy targets do not have DCT IDs. Keep them usable, but require
+                            # much stronger visual proof so random camera frames do not auto-open output.
+                            accept_match = (
+                                ai_gate_passed
+                                and best_score >= LEGACY_AI_STRICT_THRESHOLD
+                                and orb_score1 > orb_score2
+                                and orb_score1 >= LEGACY_ORB_THRESHOLD
+                            )
+
+                        if accept_match:
                             if ENFORCE_WATERMARK and not is_watermarked:
                                 return ScanResponse(
                                     matchFound=False, 
@@ -1219,6 +1261,8 @@ async def scan_frame(
                                 )
                             if not is_watermarked:
                                 print("  [WATERMARK] Not detected, but allowed (ENFORCE_WATERMARK=False).")
+                            is_match = True
+                            print(f"  [VERIFIED] Identity confirmed: {best_id[:12]}")
                         else:
                             print(f"  [REJECTED] Verification failed.")
                             print(f"  [REJECTED] Too much ambiguity even for OpenCV.")
@@ -1234,6 +1278,11 @@ async def scan_frame(
                     print(f"  Vote Count: {candidate_vote_count.get(best_id, 0)}/{total_queries}")
                     print(f"  Vote Ratio: {vote_ratio:.4f} (min {MIN_VOTE_RATIO:.2f})")
                     print(f"  AI Gate Passed: {ai_gate_passed}")
+                    print(f"  Candidate Has DCT Watermark: {best_has_dct_watermark}")
+                    print(f"  Candidate Is Duplicate Group: {best_is_duplicate_group}")
+                    if watermark_scores:
+                        print(f"  DCT Assist Scores: {watermark_scores}")
+                        print(f"  DCT Assist Passed: {watermark_assisted_pass}")
                     if 'orb_score1' in locals():
                         print(f"  ORB Score: {orb_score1}")
                     print(f"  Matched ID: {best_id if is_match else 'None'}")
@@ -1249,51 +1298,26 @@ async def scan_frame(
                         if doc:
                             print(f"  [FINAL MATCH] {content_id}")
                         else:
-                            return ScanResponse(matchFound=False, confidence=0, matchPercentage=0, message="No DB data")
+                            return ScanResponse(matchFound=False, confidence=0, matchPercentage=0, message="image not in database")
                     else:
                         # Improved feedback for near-misses and new users
                         detected_pct = int(best_score * 100)
-                        required_pct = int(AI_MATCH_THRESHOLD * 100)
                         
-                        if best_score < AI_MIN_SCAN_THRESHOLD:
-                            # User requested: No percent, just "Image not uploaded"
-                            return ScanResponse(
-                                matchFound=False, 
-                                confidence=0, 
-                                matchPercentage=0,
-                                message="Image not uploaded"
-                            )
-                        else:
-                            # AI found a strong candidate, but one or more verification gates failed.
-                            gate_reasons = []
-                            if not has_required_gap:
-                                gate_reasons.append(f"low gap (<{AI_GAP_THRESHOLD:.2f})")
-                            if not has_required_votes:
-                                gate_reasons.append(f"low vote ratio (<{MIN_VOTE_RATIO:.2f})")
-                            if 'orb_score1' in locals() and orb_score1 < ORB_THRESHOLD:
-                                gate_reasons.append(f"ORB<{ORB_THRESHOLD}")
-
-                            if gate_reasons:
-                                reason_text = ", ".join(gate_reasons)
-                                msg = f"AI match {detected_pct}% but verification failed: {reason_text}."
-                            else:
-                                msg = f"AI match {detected_pct}% but final confidence did not pass (~{required_pct}% weighted threshold)."
-                            
                         return ScanResponse(
                             matchFound=False, 
                             confidence=float(best_score), 
                             matchPercentage=detected_pct,
-                            message=msg
+                            message="image not in database"
                         )
                 else:
-                    return ScanResponse(matchFound=False, confidence=0, matchPercentage=0, message="No match found.")
+                    return ScanResponse(matchFound=False, confidence=0, matchPercentage=0, message="image not in database")
             except Exception as e:
                 print(f"Visual matching error: {e}")
                 import traceback; traceback.print_exc()
-                return ScanResponse(matchFound=False, confidence=0, matchPercentage=0, message="Scanning error.")
+                return ScanResponse(matchFound=False, confidence=0, matchPercentage=0, message="image not in database")
 
         if not doc:
-            return ScanResponse(matchFound=False, confidence=0, matchPercentage=0, message="Match found but content was deleted.")
+            return ScanResponse(matchFound=False, confidence=0, matchPercentage=0, message="image not in database")
 
         doc["_id"] = str(doc.get("_id", ""))
         match_content = ARContentResponse(**doc)
@@ -1328,3 +1352,634 @@ async def scan_frame(
                 print(f"  [DEBUG] Failed scan saved to {failed_path}")
             else:
                 os.remove(temp_path)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Products API
+# ══════════════════════════════════════════════════════════════════════════
+
+DEFAULT_PRODUCTS = [
+    {
+        "productId": "1",
+        "title": "Distressed White Farmhouse Frame",
+        "category": "Birthday",
+        "price": "₹299",
+        "originalPrice": "₹699",
+        "image": "https://images.unsplash.com/photo-1513519245088-0e12902e5a38?auto=format&fit=crop&q=80&w=800",
+        "description": "Premium handcrafted distressed white farmhouse frame. Give your warm memories a charming rustic look.",
+        "createdAt": datetime.now(timezone.utc).isoformat()
+    },
+    {
+        "productId": "2",
+        "title": "Rustic Dark Wood Frame",
+        "category": "Anniversary",
+        "price": "₹200",
+        "originalPrice": "₹399",
+        "image": "https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?auto=format&fit=crop&q=80&w=800",
+        "description": "Classic dark wood profile with deep grain texture. Perfect for anniversary memories and premium portraits.",
+        "createdAt": datetime.now(timezone.utc).isoformat()
+    },
+    {
+        "productId": "3",
+        "title": "Classic Gold Ornate Frame",
+        "category": "Family",
+        "price": "₹250",
+        "originalPrice": "₹450",
+        "image": "https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?auto=format&fit=crop&q=80&w=800",
+        "description": "Elegant gold baroque frame with beautiful ornate carvings. A luxurious addition to any living space.",
+        "createdAt": datetime.now(timezone.utc).isoformat()
+    },
+    {
+        "productId": "4",
+        "title": "Petite Memories Mini Frame",
+        "category": "Return Gift",
+        "price": "₹499",
+        "originalPrice": "₹799",
+        "image": "https://images.unsplash.com/photo-1544457070-4cd773b4d71e?auto=format&fit=crop&q=80&w=800",
+        "description": "Small table frames, ideal for returning gifts and event giveaways.",
+        "createdAt": datetime.now(timezone.utc).isoformat()
+    },
+    {
+        "productId": "5",
+        "title": "Personalized Square Keychain",
+        "category": "Keychains",
+        "price": "₹199",
+        "image": "https://images.unsplash.com/photo-1574634534894-89d7576c8259?auto=format&fit=crop&q=80&w=800",
+        "description": "Carry your loved ones wherever you go with our Personalized Square Keychain, made from high-quality stainless steel.",
+        "createdAt": datetime.now(timezone.utc).isoformat()
+    }
+]
+
+
+@router.get("/products")
+async def get_products():
+    """Retrieve all products. If empty, automatically seed defaults."""
+    col = get_products_collection()
+    if col is None:
+        return DEFAULT_PRODUCTS
+
+    count = await col.count_documents({})
+    if count == 0:
+        for p in DEFAULT_PRODUCTS:
+            await col.insert_one(p.copy())
+    
+    cursor = col.find({}).sort("createdAt", -1)
+    results = []
+    async for doc in cursor:
+        doc["_id"] = str(doc.get("_id", ""))
+        results.append(doc)
+    return results
+
+
+@router.post("/products")
+async def create_product(
+    title: str = Form(...),
+    price: str = Form(...),
+    category: str = Form(...),
+    description: str = Form(...),
+    size: str = Form(...),
+    originalPrice: Optional[str] = Form(None),
+    sizes: Optional[str] = Form(None),  # JSON string
+    image: Optional[UploadFile] = File(None),
+    imageUrl: Optional[str] = Form(None),
+    imageFiles: Optional[List[UploadFile]] = File(None),
+    imageUrls: Optional[str] = Form(None)  # comma separated list
+):
+    """Create a new product in database."""
+    col = get_products_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    all_images = []
+
+    # Process first/main image if provided
+    main_image = imageUrl or ""
+    if image and image.filename:
+        saved_path, _ = await _save_upload(image, "images")
+        abs_saved_path = os.path.join(os.getcwd(), saved_path.lstrip("/"))
+        cloud_url = _upload_to_cloudinary(abs_saved_path, resource_type="image", folder="products")
+        main_image = cloud_url if cloud_url else saved_path
+
+    if main_image:
+        all_images.append(main_image)
+
+    # Process multiple image files
+    if imageFiles:
+        for img_file in imageFiles:
+            if img_file.filename:
+                saved_path, _ = await _save_upload(img_file, "images")
+                abs_saved_path = os.path.join(os.getcwd(), saved_path.lstrip("/"))
+                cloud_url = _upload_to_cloudinary(abs_saved_path, resource_type="image", folder="products")
+                url = cloud_url if cloud_url else saved_path
+                all_images.append(url)
+
+    # Process comma separated image URLs
+    if imageUrls:
+        for url in imageUrls.split(","):
+            url = url.strip()
+            if url:
+                all_images.append(url)
+
+    # Clean up empty strings or duplicates
+    all_images = list(dict.fromkeys([x for x in all_images if x]))
+
+    if not all_images:
+        raise HTTPException(status_code=400, detail="At least one product image is required")
+
+    # Fallback if main image wasn't set specifically
+    if not main_image:
+        main_image = all_images[0]
+
+    # Parse sizes
+    parsed_sizes = []
+    if sizes:
+        try:
+            parsed_sizes = json.loads(sizes)
+        except Exception as e:
+            print(f"Error parsing sizes: {e}")
+
+    product_doc = {
+        "productId": str(uuid.uuid4()),
+        "title": title,
+        "price": price if price.startswith("₹") else f"₹{price}",
+        "originalPrice": originalPrice if not originalPrice or originalPrice.startswith("₹") else f"₹{originalPrice}",
+        "category": category,
+        "size": size,
+        "description": description,
+        "image": main_image,
+        "images": all_images,
+        "sizes": parsed_sizes,
+        "createdAt": datetime.now(timezone.utc).isoformat()
+    }
+    await col.insert_one(product_doc)
+    product_doc["_id"] = str(product_doc.get("_id", ""))
+    return {"message": "Product created successfully", "product": product_doc}
+
+
+@router.delete("/products/{product_id}")
+async def delete_product(product_id: str):
+    """Delete a product by ID."""
+    col = get_products_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    doc = await col.find_one({"productId": product_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    image_url = doc.get("image", "")
+    if image_url:
+        if image_url.startswith("http"):
+            _delete_from_cloudinary(image_url)
+        else:
+            abs_path = os.path.join(os.getcwd(), image_url.lstrip("/"))
+            if os.path.exists(abs_path):
+                os.remove(abs_path)
+
+    # Also clean up all other images in the list
+    other_images = doc.get("images", [])
+    for img_url in other_images:
+        if img_url != image_url:
+            if img_url.startswith("http"):
+                _delete_from_cloudinary(img_url)
+            else:
+                abs_path = os.path.join(os.getcwd(), img_url.lstrip("/"))
+                if os.path.exists(abs_path):
+                    os.remove(abs_path)
+
+    await col.delete_one({"productId": product_id})
+    return {"message": "Product deleted successfully"}
+
+
+@router.put("/products/{product_id}")
+async def update_product(
+    product_id: str,
+    title: Optional[str] = Form(None),
+    price: Optional[str] = Form(None),
+    originalPrice: Optional[str] = Form(None),
+    category: Optional[str] = Form(None),
+    size: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    sizes: Optional[str] = Form(None),  # JSON string
+    image: Optional[UploadFile] = File(None),
+    imageUrl: Optional[str] = Form(None),
+    imageFiles: Optional[List[UploadFile]] = File(None),
+    imageUrls: Optional[str] = Form(None)
+):
+    """Update an existing product by ID."""
+    col = get_products_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    doc = await col.find_one({"productId": product_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    update_data = {}
+    if title is not None:
+        update_data["title"] = title
+    if price is not None:
+        update_data["price"] = price if price.startswith("₹") else f"₹{price}"
+    if originalPrice is not None:
+        update_data["originalPrice"] = originalPrice if not originalPrice or originalPrice.startswith("₹") else f"₹{originalPrice}"
+    if category is not None:
+        update_data["category"] = category
+    if size is not None:
+        update_data["size"] = size
+    if description is not None:
+        update_data["description"] = description
+    if sizes is not None:
+        try:
+            update_data["sizes"] = json.loads(sizes)
+        except Exception as e:
+            print(f"Error parsing sizes: {e}")
+
+    # Handle image updates
+    # We will build the new images list if imageUrls, imageFiles, image, or imageUrl is provided.
+    # Note: frontend sends remaining urls in imageUrls, and new files in imageFiles.
+    has_image_update = (imageUrls is not None) or (imageFiles is not None) or (image is not None) or (imageUrl is not None)
+    
+    if has_image_update:
+        final_images = []
+        
+        # 1. Add remaining existing URLs (if imageUrls parameter was provided)
+        if imageUrls is not None:
+            for url in imageUrls.split(","):
+                url = url.strip()
+                if url:
+                    final_images.append(url)
+        else:
+            # If imageUrls is not provided, default to current images
+            final_images.extend(doc.get("images", []))
+            if not final_images and doc.get("image"):
+                final_images.append(doc["image"])
+
+        # 2. Process new main image upload if any
+        if image and image.filename:
+            saved_path, _ = await _save_upload(image, "images")
+            abs_saved_path = os.path.join(os.getcwd(), saved_path.lstrip("/"))
+            cloud_url = _upload_to_cloudinary(abs_saved_path, resource_type="image", folder="products")
+            main_img_url = cloud_url if cloud_url else saved_path
+            final_images.append(main_img_url)
+        elif imageUrl is not None and imageUrl.strip():
+            if imageUrl not in final_images:
+                final_images.append(imageUrl)
+
+        # 3. Process new multiple image files if any
+        if imageFiles:
+            for img_file in imageFiles:
+                if img_file.filename:
+                    saved_path, _ = await _save_upload(img_file, "images")
+                    abs_saved_path = os.path.join(os.getcwd(), saved_path.lstrip("/"))
+                    cloud_url = _upload_to_cloudinary(abs_saved_path, resource_type="image", folder="products")
+                    url = cloud_url if cloud_url else saved_path
+                    final_images.append(url)
+
+        # Clean list
+        final_images = list(dict.fromkeys([x for x in final_images if x]))
+        
+        if not final_images:
+            raise HTTPException(status_code=400, detail="At least one product image is required")
+            
+        update_data["images"] = final_images
+        update_data["image"] = final_images[0]
+
+    if update_data:
+        await col.update_one({"productId": product_id}, {"$set": update_data})
+
+    updated_doc = await col.find_one({"productId": product_id})
+    updated_doc["_id"] = str(updated_doc.get("_id", ""))
+    return {"message": "Product updated successfully", "product": updated_doc}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+@router.get("/orders/lookup")
+async def lookup_orders(query: str):
+    """Look up orders by customer email or contact number."""
+    col = get_orders_collection()
+    if col is None:
+        return []
+
+    clean_query = query.strip()
+    if not clean_query:
+        return []
+
+    cursor = col.find({
+        "$or": [
+            {"customerDetails.contact": clean_query},
+            {"customerDetails.email": {"$regex": f"^{re.escape(clean_query)}$", "$options": "i"}}
+        ]
+    }).sort("createdAt", -1)
+
+    results = []
+    async for doc in cursor:
+        doc["_id"] = str(doc.get("_id", ""))
+        results.append(doc)
+    return results
+
+
+@router.get("/orders")
+async def get_orders():
+    """Retrieve all placed orders."""
+    col = get_orders_collection()
+    if col is None:
+        return []
+
+    cursor = col.find({}).sort("createdAt", -1)
+    results = []
+    async for doc in cursor:
+        doc["_id"] = str(doc.get("_id", ""))
+        results.append(doc)
+    return results
+
+
+@router.post("/orders")
+async def create_order(
+    customerName: str = Form(...),
+    customerContact: str = Form(...),
+    customerAddress: str = Form(...),
+    customerPincode: str = Form(...),
+    customerEmail: Optional[str] = Form(""),
+    items: str = Form(...),  # JSON string
+    total: str = Form(...),
+    arType: str = Form("text"),
+    arText: Optional[str] = Form(None),
+    arLink: Optional[str] = Form(None),
+    image: Optional[UploadFile] = File(None),
+    arFile: Optional[UploadFile] = File(None)
+):
+    """Place a new order with optional uploaded photo and AR content."""
+    col = get_orders_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    # Save customer frame photo
+    frame_photo_url = ""
+    frame_photo_hash = ""
+    frame_photo_dhash = ""
+    if image and image.filename:
+        saved_path, _ = await _save_upload(image, "images")
+        abs_saved_path = os.path.join(os.getcwd(), saved_path.lstrip("/"))
+        try:
+            frame_photo_hash = calculate_file_hash(abs_saved_path)
+            frame_photo_dhash = calculate_image_dhash(abs_saved_path)
+        except Exception as eh:
+            print(f"Error calculating hashes: {eh}")
+        cloud_url = _upload_to_cloudinary(abs_saved_path, resource_type="image", folder="orders")
+        frame_photo_url = cloud_url if cloud_url else saved_path
+
+    # Save AR attachment file
+    ar_file_url = ""
+    if arFile and arFile.filename:
+        subfolder = _CONTENT_TYPE_SUBFOLDER.get(arType, "images")
+        saved_path, _ = await _save_upload(arFile, subfolder)
+        abs_saved_path = os.path.join(os.getcwd(), saved_path.lstrip("/"))
+        cloud_url = _upload_to_cloudinary(abs_saved_path, resource_type="auto", folder="orders")
+        ar_file_url = cloud_url if cloud_url else saved_path
+
+    try:
+        parsed_items = json.loads(items)
+    except:
+        parsed_items = [{"title": "Custom Frame Story Piece", "price": total, "quantity": 1}]
+
+    order_doc = {
+        "orderId": str(uuid.uuid4()),
+        "customerDetails": {
+            "name": customerName,
+            "contact": customerContact,
+            "address": customerAddress,
+            "pincode": customerPincode,
+            "email": customerEmail
+        },
+        "items": parsed_items,
+        "total": total,
+        "arType": arType,
+        "arText": arText,
+        "arLink": arLink,
+        "framePhoto": frame_photo_url,
+        "framePhotoHash": frame_photo_hash,
+        "framePhotoDHash": frame_photo_dhash,
+        "arFile": ar_file_url,
+        "status": "Pending",
+        "createdAt": datetime.now(timezone.utc).isoformat()
+    }
+    await col.insert_one(order_doc)
+    return {"message": "Order placed successfully", "orderId": order_doc["orderId"]}
+
+
+@router.post("/orders/check-duplicate-frame")
+async def check_duplicate_frame(
+    frame: UploadFile = File(...),
+):
+    """
+    Check if the uploaded customer frame photo already exists in any placed order.
+    Uses both SHA-256 (exact) and perceptual dHash (visual similarity).
+    """
+    col = get_orders_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    # Save to temp location to compute hash
+    temp_dir = os.path.join(UPLOAD_DIR, "temp_scans")
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_filename = f"check_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:8]}.jpg"
+    temp_path = os.path.join(temp_dir, temp_filename)
+
+    try:
+        content = await frame.read()
+        with open(temp_path, "wb") as f:
+            f.write(content)
+
+        # Compute hashes
+        uploaded_hash = calculate_file_hash(temp_path)
+        uploaded_dhash = calculate_image_dhash(temp_path)
+
+        # 1. Check for exact SHA-256 match
+        exact_doc = await col.find_one({"framePhotoHash": uploaded_hash})
+        if exact_doc:
+            print(f"[DUPLICATE FRAME] Exact match found with order {exact_doc.get('orderId')}")
+            return {"matchFound": True, "message": "This image already exists in our database. Please upload a different image."}
+
+        # 2. Check for perceptual dHash match
+        cursor = col.find({"framePhotoDHash": {"$regex": r"^[0-9a-f]+$"}})
+        async for doc in cursor:
+            existing_dhash = doc.get("framePhotoDHash")
+            distance = hamming_distance_hex(uploaded_dhash, existing_dhash)
+            if distance <= 10:
+                print(f"[DUPLICATE FRAME] Perceptual match found with order {doc.get('orderId')} (distance={distance})")
+                return {"matchFound": True, "message": "This image already exists in our database. Please upload a different image."}
+
+        return {"matchFound": False}
+
+    except Exception as e:
+        print(f"Error checking duplicate frame: {e}")
+        return {"matchFound": False}
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+@router.delete("/orders/{order_id}")
+async def delete_order(order_id: str):
+    """Delete/Cancel an order by ID."""
+    col = get_orders_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    doc = await col.find_one({"orderId": order_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # Cleanup files
+    for url in [doc.get("framePhoto"), doc.get("arFile")]:
+        if url:
+            if url.startswith("http"):
+                _delete_from_cloudinary(url)
+            else:
+                abs_path = os.path.join(os.getcwd(), url.lstrip("/"))
+                if os.path.exists(abs_path):
+                    os.remove(abs_path)
+
+    await col.delete_one({"orderId": order_id})
+    return {"message": "Order deleted successfully"}
+
+
+@router.put("/orders/{order_id}")
+async def update_order(
+    order_id: str,
+    status: Optional[str] = Form(None),
+    customerName: Optional[str] = Form(None),
+    customerContact: Optional[str] = Form(None),
+    customerAddress: Optional[str] = Form(None),
+    customerPincode: Optional[str] = Form(None)
+):
+    """Update an existing order (status or customer details) by ID."""
+    col = get_orders_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    doc = await col.find_one({"orderId": order_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    update_data = {}
+    if status is not None:
+        update_data["status"] = status
+
+    customer_details = doc.get("customerDetails", {})
+    if customerName is not None:
+        customer_details["name"] = customerName
+    if customerContact is not None:
+        customer_details["contact"] = customerContact
+    if customerAddress is not None:
+        customer_details["address"] = customerAddress
+    if customerPincode is not None:
+        customer_details["pincode"] = customerPincode
+
+    update_data["customerDetails"] = customer_details
+
+    await col.update_one({"orderId": order_id}, {"$set": update_data})
+
+    updated_doc = await col.find_one({"orderId": order_id})
+    updated_doc["_id"] = str(updated_doc.get("_id", ""))
+    return {"message": "Order updated successfully", "order": updated_doc}
+
+
+import base64
+import json
+import random
+import string
+
+def decode_google_jwt(credential: str):
+    try:
+        parts = credential.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1]
+        padded = payload_b64 + "=" * (4 - len(payload_b64) % 4)
+        decoded_bytes = base64.urlsafe_b64decode(padded)
+        payload = json.loads(decoded_bytes.decode("utf-8"))
+        return payload
+    except Exception as e:
+        print(f"Error decoding JWT: {e}")
+        return None
+
+@router.post("/auth/google")
+async def google_auth(payload: dict = Body(...)):
+    credential = payload.get("credential")
+    if not credential:
+        raise HTTPException(status_code=400, detail="Credential is required")
+        
+    user_info = decode_google_jwt(credential)
+    if not user_info:
+        raise HTTPException(status_code=400, detail="Invalid token")
+        
+    email = user_info.get("email")
+    name = user_info.get("name", "")
+    picture = user_info.get("picture", "")
+    
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+        
+    users_col = get_website_users_collection()
+    if users_col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+        
+    user = await users_col.find_one({"email": email})
+    if not user:
+        while True:
+            rand_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+            user_id = f"USR-{rand_suffix}"
+            existing = await users_col.find_one({"userId": user_id})
+            if not existing:
+                break
+                
+        user = {
+            "userId": user_id,
+            "email": email,
+            "name": name,
+            "picture": picture,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "details": {}
+        }
+        await users_col.insert_one(user)
+    else:
+        await users_col.update_one(
+            {"email": email},
+            {"$set": {"name": name, "picture": picture}}
+        )
+        user = await users_col.find_one({"email": email})
+        
+    user["_id"] = str(user["_id"])
+    return user
+
+@router.put("/users/profile")
+async def update_user_profile(payload: dict = Body(...)):
+    email = payload.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+    
+    users_col = get_website_users_collection()
+    if users_col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+        
+    user = await users_col.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    current_details = user.get("details", {}) or {}
+    details = {
+        "name": payload.get("name", current_details.get("name", "")),
+        "contact": payload.get("contact", current_details.get("contact", "")),
+        "address": payload.get("address", current_details.get("address", "")),
+        "pincode": payload.get("pincode", current_details.get("pincode", ""))
+    }
+    
+    await users_col.update_one(
+        {"email": email},
+        {"$set": {"details": details}}
+    )
+    
+    updated_user = await users_col.find_one({"email": email})
+    updated_user["_id"] = str(updated_user["_id"])
+    return updated_user

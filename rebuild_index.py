@@ -2,8 +2,10 @@
 import asyncio
 import os
 from database import connect_db, get_images_collection
-from embeddings import extract_augmented_embeddings
+from embeddings import extract_embedding, extract_augmented_embeddings
 import faiss_index
+import httpx
+import tempfile
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -44,13 +46,35 @@ async def rebuild():
         
         print(f"Indexing {content_id} ({image_path})...")
         try:
-            embeddings = extract_augmented_embeddings(image_path)
+            # Handle Cloudinary URLs
+            if image_path.startswith("http"):
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(image_path)
+                    if resp.status_code == 200:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                            tmp.write(resp.content)
+                            tmp_path = tmp.name
+                        
+                        embeddings = extract_augmented_embeddings(tmp_path)
+                        os.remove(tmp_path)
+                    else:
+                        print(f"Failed to download {image_path}")
+                        continue
+            else:
+                abs_path = os.path.join(os.getcwd(), image_path.lstrip("/"))
+                if not os.path.exists(abs_path):
+                    print(f"File missing: {abs_path}")
+                    continue
+                embeddings = extract_augmented_embeddings(abs_path)
 
             for emb in embeddings:
                 idx.add(emb, content_id)
             count += 1
         except Exception as e:
             print(f"Failed to index {content_id}: {e}")
+
+    if count == 0:
+        idx.save()
 
     print(f"Done! Indexed {count} images.")
 

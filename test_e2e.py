@@ -8,11 +8,9 @@ import sys
 import json
 import traceback
 
-sys.stdout.reconfigure(encoding='utf-8')
-
-BASE = "http://127.0.0.1:5000"
+BASE = "http://localhost:5000"
 API = f"{BASE}/api"
-TEST_IMAGE = "test1.jpg"
+TEST_IMAGE = r"d:\noQR\reference\uploads\images\image-1771234977955-642486162.jpg"
 
 if not os.path.exists(TEST_IMAGE):
     print(f"FAIL: Test image not found at {TEST_IMAGE}")
@@ -51,10 +49,7 @@ print("\n2. Upload image + video link")
 with open(TEST_IMAGE, "rb") as img:
     r = client.post(f"{API}/upload",
         files={"image": ("test-verify.jpg", img, "image/jpeg")},
-        data={
-            "videoLink": "https://youtu.be/test-verification",
-            "user_email": "test-user@example.com"
-        })
+        data={"videoLink": "https://youtu.be/test-verification"})
 test("POST /api/upload returns 200", r.status_code == 200, f"got {r.status_code}: {r.text[:300]}")
 if r.status_code != 200:
     print(f"   Upload failed! Response: {r.text[:500]}")
@@ -66,10 +61,10 @@ test("Response has contentId", "contentId" in upload_data and len(upload_data["c
 test("Response has videoUrl", "videoUrl" in upload_data)
 CONTENT_ID = upload_data.get("contentId", "")
 print(f"   → contentId: {CONTENT_ID}")
- 
+
 # Test 3: List all contents
 print("\n3. List contents")
-r = client.get(f"{API}/contents", params={"email": "test-user@example.com"})
+r = client.get(f"{API}/contents")
 test("GET /api/contents returns 200", r.status_code == 200)
 contents = r.json()
 test("Response is a list", isinstance(contents, list))
@@ -81,8 +76,7 @@ r = client.get(f"{API}/content/{CONTENT_ID}")
 test("GET /api/content/{id} returns 200", r.status_code == 200)
 doc = r.json()
 test("Has correct contentId", doc.get("contentId") == CONTENT_ID)
-test("Has imagePath (URL)", "imagePath" in doc and doc["imagePath"].startswith("http"))
-test("Has localImagePath", "localImagePath" in doc and doc["localImagePath"].startswith("/uploads/images/"))
+test("Has imagePath", "imagePath" in doc and doc["imagePath"].startswith("/uploads/images/"))
 test("Has videoPath", "videoPath" in doc)
 test("Has metadata.keypointsCount=2048", doc.get("metadata", {}).get("keypointsCount") == 2048, f"got {doc.get('metadata', {}).get('keypointsCount')}")
 

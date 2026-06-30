@@ -131,10 +131,18 @@ def _pilot_positions(height: int, width: int, seed_tag: str, count: int = PILOT_
     return positions[:min(count, len(positions))]
 
 
+def convert_to_rgb_with_white_bg(img: Image.Image) -> Image.Image:
+    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+        alpha = img.convert('RGBA').split()[-1]
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        bg.paste(img, mask=alpha)
+        return bg.convert('RGB')
+    return img.convert('RGB')
+
 def _prepare_luma(path: str, target_size: int | None = None) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
-    from embeddings import load_image_from_path_or_url
+    from embeddings import load_image_from_path_or_url, _opencv_to_pil
     opencv_img = load_image_from_path_or_url(path)
-    img = Image.fromarray(cv2.cvtColor(opencv_img, cv2.COLOR_BGR2RGB))
+    img = _opencv_to_pil(opencv_img)
     original_size = img.size
     if target_size:
         img.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
@@ -310,9 +318,9 @@ def _read_bit_votes(
 
 
 def extract_watermark(path: str, repetitions: int = DEFAULT_REPETITIONS) -> WatermarkResult:
-    from embeddings import load_image_from_path_or_url
+    from embeddings import load_image_from_path_or_url, _opencv_to_pil
     opencv_img = load_image_from_path_or_url(path)
-    img = Image.fromarray(cv2.cvtColor(opencv_img, cv2.COLOR_BGR2RGB))
+    img = _opencv_to_pil(opencv_img)
     rgb = np.array(img)
     candidates: list[WatermarkResult] = []
 
@@ -347,9 +355,9 @@ def expected_watermark_score(path: str, watermark_id: str, repetitions: int = DE
     under print-scan damage than blind CRC decode because it asks: "does this
     scan look more like candidate A's watermark or candidate B's watermark?"
     """
-    from embeddings import load_image_from_path_or_url
+    from embeddings import load_image_from_path_or_url, _opencv_to_pil
     opencv_img = load_image_from_path_or_url(path)
-    img = Image.fromarray(cv2.cvtColor(opencv_img, cv2.COLOR_BGR2RGB))
+    img = _opencv_to_pil(opencv_img)
     rgb = np.array(img)
     variants = [rgb]
     if max(rgb.shape[:2]) != CANONICAL_MAX_DIM:

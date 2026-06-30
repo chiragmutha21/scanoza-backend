@@ -47,7 +47,7 @@ def load_image_from_path_or_url(image_path: str, grayscale: bool = False) -> np.
     if not image_path:
         raise ValueError("Empty image path or URL")
 
-    mode = cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_COLOR
+    mode = cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_UNCHANGED
     if image_path.lower().startswith(("http://", "https://")):
         response = requests.get(image_path, timeout=20.0)
         response.raise_for_status()
@@ -77,8 +77,19 @@ def load_image_from_path_or_url(image_path: str, grayscale: bool = False) -> np.
 
 
 def _opencv_to_pil(image: np.ndarray) -> Image.Image:
-    """Convert a BGR OpenCV image to an RGB PIL image without temp files."""
-    return Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    """Convert an OpenCV image (BGR/BGRA/Grayscale) to an RGB PIL image, blending alpha onto a white background."""
+    if len(image.shape) == 2:
+        return Image.fromarray(cv2.cvtColor(image, cv2.COLOR_GRAY2RGB))
+    if image.shape[2] == 4:
+        alpha = image[:, :, 3] / 255.0
+        alpha = np.expand_dims(alpha, axis=2)
+        bgr = image[:, :, :3]
+        white_bg = np.ones_like(bgr, dtype=np.uint8) * 255
+        blended = (bgr * alpha + white_bg * (1.0 - alpha)).astype(np.uint8)
+        rgb = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
+    else:
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
 
 
 def _extract_single(img: Image.Image) -> np.ndarray:
@@ -95,7 +106,7 @@ def _extract_single(img: Image.Image) -> np.ndarray:
 
 def extract_embedding(image_path: str) -> np.ndarray:
     """
-    Extract a 2048-d L2-normalized embedding from an image file.
+    Extract a 2048-d L2-normalized embedding from an image file or URL.
     Uses the original image only (no augmentation) for clean indexing.
 
     Args:
